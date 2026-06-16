@@ -15,9 +15,11 @@ import { config } from "../config.ts";
 import { db, latestClaudeSessionId } from "../db.ts";
 import { bridgeStream } from "../activity-bridge.ts";
 import { runnerDeps } from "./deps.ts";
+import { makeCanUseTool } from "./question-handler.ts";
 import { log } from "../log.ts";
 
-const PLAN_ALLOWED_TOOLS = ["Read", "Glob", "Grep", "WebFetch", "WebSearch"];
+// "AskUserQuestion" MUST be allowlisted for mid-run HITL to fire via canUseTool.
+const PLAN_ALLOWED_TOOLS = ["Read", "Glob", "Grep", "WebFetch", "WebSearch", "AskUserQuestion"];
 
 function buildPlanPrompt(promptContext: string | null): string {
   return [
@@ -80,6 +82,7 @@ export async function runPlan(ctx: RunnerContext): Promise<RunnerResult> {
       allowedTools: PLAN_ALLOWED_TOOLS,
       resume,
       abortController,
+      canUseTool: makeCanUseTool(job, signal, { sendQuestion: deps.sendQuestion }),
     });
 
     const outcome = await bridgeStream(stream, {

@@ -2,6 +2,7 @@
 //   POST /jobs            create a plan/revise/execute job (validate, auth, dedupe, async run)
 //   POST /jobs/reap       sweeper worktree reclamation (idempotent; keeps the claude session)
 //   POST /jobs/:id/abort  signal abort (idempotent)
+//   POST /jobs/:id/answer deliver answers to a pending mid-run AskUserQuestion (idempotent)
 //   GET  /healthz         liveness + load
 //
 // Route handlers are factored as pure-ish functions over a Deps bundle so they're testable
@@ -17,15 +18,18 @@ import {
   CONTRACT_VERSION,
   CreateJobRequest,
   ReapWorktreeRequest,
+  AnswerRequest,
   type CreateJobResponse,
   type AbortJobResponse,
   type HealthzResponse,
   type ReapWorktreeResponse,
+  type AnswerResponse,
 } from "./contract.ts";
 import { getJob, getJobByIdempotencyKey, insertJob } from "./db.ts";
 import { JobController, type Runner } from "./jobctl.ts";
 import { makeRunner } from "./runners/index.ts";
 import { reapWorktree } from "./workspace/index.ts";
+import { resolveQuestion } from "./questions.ts";
 
 const START_TIME = Date.now();
 
@@ -34,6 +38,7 @@ export interface App {
   handleCreateJob(req: Request): Promise<Response>;
   handleAbort(jobId: string, req: Request): Promise<Response>;
   handleReap(req: Request): Promise<Response>;
+  handleAnswer(jobId: string, req: Request): Promise<Response>;
   handleHealthz(): Response;
   fetch(req: Request): Promise<Response>;
 }
@@ -164,6 +169,31 @@ export function createApp(deps: AppDeps = {}): App {
     return json(res, 200);
   }
 
+  // POST /jobs/:id/answer — Vercel delivers the user's answers to a pending mid-run question.
+  // The :id (jobId) is informational; the questionId in the body is the authoritative correlation
+  // key (a job may have asked, the run moved on, then a stale answer arrives). delivered=false if
+  // no pending question matched (stale/unknown), still 200.
+  async function handleAnswer(_jobId: string, req: Request): Promise<Response> {
+    if (!cfAccessOk(req)) return json({ error: "forbidden" }, 403);
+
+    let raw: unknown;
+    try {
+      raw = await req.json();
+    } catch {
+      return json({ error: "invalid-json" }, 400);
+    }
+    if (hasVersionMismatch(raw)) return versionMismatch();
+
+    const parsed = AnswerRequest.safeParse(raw);
+    if (!parsed.success) {
+      return json({ error: "validation", issues: z.treeifyError(parsed.error) }, 400);
+    }
+
+    const delivered = resolveQuestion(parsed.data.questionId, parsed.data.answers);
+    const res: AnswerResponse = { questionId: parsed.data.questionId, delivered };
+    return json(res, 200);
+  }
+
   function handleHealthz(): Response {
     const res: HealthzResponse = {
       ok: true,
@@ -183,6 +213,8 @@ export function createApp(deps: AppDeps = {}): App {
     if (req.method === "POST" && pathname === "/jobs/reap") return handleReap(req);
     const abortMatch = pathname.match(/^\/jobs\/([^/]+)\/abort$/);
     if (req.method === "POST" && abortMatch) return handleAbort(decodeURIComponent(abortMatch[1]!), req);
+    const answerMatch = pathname.match(/^\/jobs\/([^/]+)\/answer$/);
+    if (req.method === "POST" && answerMatch) return handleAnswer(decodeURIComponent(answerMatch[1]!), req);
     if (req.method === "GET" && pathname === "/healthz") return handleHealthz();
     return json({ error: "not-found" }, 404);
   }
@@ -192,6 +224,7 @@ export function createApp(deps: AppDeps = {}): App {
     handleCreateJob,
     handleAbort,
     handleReap,
+    handleAnswer,
     handleHealthz,
     fetch: fetchHandler,
   };
@@ -210,6 +243,9 @@ export function startServer(deps: AppDeps = {}) {
       },
       "/jobs/:id/abort": {
         POST: (req) => app.handleAbort(req.params.id, req),
+      },
+      "/jobs/:id/answer": {
+        POST: (req) => app.handleAnswer(req.params.id, req),
       },
       "/healthz": {
         GET: () => app.handleHealthz(),

@@ -2,4 +2,4 @@
 // They live ONCE in packages/contract/src/index.ts (contract §3). This shim keeps the local
 // "@/lib/tokens" import path stable. MUST stay pure functions of their inputs (no Date.now /
 // randomness) — they are recomputed on every workflow replay and must be identical each time.
-export { promptToken, jobDoneToken } from "@linear-agent/contract";
+export { promptToken, jobDoneToken, questionToken } from "@linear-agent/contract";

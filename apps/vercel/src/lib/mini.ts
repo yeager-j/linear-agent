@@ -5,12 +5,15 @@
 
 import {
   AbortJobResponse,
+  AnswerRequest,
+  AnswerResponse,
   CONTRACT_VERSION,
   CreateJobRequest,
   CreateJobResponse,
   HealthzResponse,
   ReapWorktreeRequest,
   ReapWorktreeResponse,
+  type AnswerResponse as AnswerResponseT,
   type CreateJobResponse as CreateJobResponseT,
   type HealthzResponse as HealthzResponseT,
   type JobKind,
@@ -121,6 +124,34 @@ export async function abortJob(jobId: string): Promise<void> {
   }
   // Validate but don't act on the result; the terminal `aborted` callback is authoritative.
   AbortJobResponse.parse(await res.json());
+}
+
+/* ───────────────────────── POST /jobs/:id/answer ───────────────────────── */
+
+// Deliver the user's answers to a mid-run AskUserQuestion so the agent's run continues
+// (contract: AnswerRequest/AnswerResponse). jobId is the path param; the body carries questionId
+// + the answers map (question text → chosen label(s)). 409 is fatal-no-retry (handled by
+// miniFetch); transient failures get bounded retry.
+export async function deliverAnswer(
+  jobId: string,
+  questionId: string,
+  answers: Record<string, string>,
+): Promise<AnswerResponseT> {
+  const body = AnswerRequest.parse({
+    contractVersion: CONTRACT_VERSION,
+    questionId,
+    answers,
+  });
+  const res = await miniFetch(`/jobs/${encodeURIComponent(jobId)}/answer`, {
+    method: "POST",
+    headers: miniHeaders(),
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`mini POST /jobs/${jobId}/answer HTTP ${res.status}: ${text.slice(0, 300)}`);
+  }
+  return AnswerResponse.parse(await res.json());
 }
 
 /* ───────────────────────── POST /jobs/reap ───────────────────────── */

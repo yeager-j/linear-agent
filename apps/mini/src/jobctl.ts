@@ -10,6 +10,7 @@ import type { Database } from "bun:sqlite";
 import { db, getJob, updateJob, type JobRow } from "./db.ts";
 import { config } from "./config.ts";
 import { sendCallback } from "./callback.ts";
+import { rejectQuestionsForJob } from "./questions.ts";
 import { log } from "./log.ts";
 import type { TerminalStatus } from "./contract.ts";
 
@@ -144,11 +145,14 @@ export class JobController {
     }
   }
 
-  // Signal abort to a running job. Idempotent: unknown/finished job => false.
+  // Signal abort to a running job. Idempotent: unknown/finished job => false. Also rejects any
+  // pending mid-run question so a stop during AskUserQuestion unblocks the canUseTool handler and
+  // the run aborts cleanly instead of hanging on the answer.
   abort(jobId: string): boolean {
     const live = this.live.get(jobId);
     if (!live) return false;
     live.controller.abort();
+    rejectQuestionsForJob(jobId, "aborted");
     log.info("job abort signalled", { jobId });
     return true;
   }

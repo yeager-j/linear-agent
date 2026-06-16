@@ -125,6 +125,12 @@ export async function emitElicitationSelect(
   });
 }
 
+// Plain elicitation (no select buttons) — used for free-text / multi-select questions where the
+// user replies with text. The reply comes back as a `prompted` event.
+export async function emitElicitation(agentSessionId: string, body: string): Promise<void> {
+  await createActivity({ agentSessionId, content: { type: "elicitation", body } });
+}
+
 /* ───────────────────────── Session update: externalUrls ───────────────────────── */
 
 const AGENT_SESSION_UPDATE = `

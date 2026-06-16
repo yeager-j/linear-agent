@@ -152,10 +152,69 @@ export const JobDoneHookPayload = z.object({
 });
 export type JobDoneHookPayload = z.infer<typeof JobDoneHookPayload>;
 
+/* ─────────────────── AskUserQuestion (mid-run HITL) ─────────────────── */
+
+// The agent (via the SDK's built-in AskUserQuestion tool) can ask clarifying questions MID-RUN.
+// The mini intercepts the tool call (canUseTool), pauses the run, and asks Vercel to elicit the
+// answer(s) in Linear, then resumes the run with them. One AskUserQuestion call may carry several
+// questions; they're answered together and returned as a map keyed by question text.
+
+// One selectable option for a question. `label` is the answer VALUE returned to the SDK.
+export const AgentQuestionOption = z.object({
+  label: z.string(),
+  description: z.string().default(""),
+});
+export type AgentQuestionOption = z.infer<typeof AgentQuestionOption>;
+
+export const AgentQuestion = z.object({
+  question: z.string(),              // the prompt text; also the KEY in the answers map
+  header: z.string().default(""),    // short label (≤12 chars in the SDK)
+  multiSelect: z.boolean().default(false),
+  options: z.array(AgentQuestionOption).default([]),
+});
+export type AgentQuestion = z.infer<typeof AgentQuestion>;
+
+// Mini → Vercel: POST /api/mini/question. The agent asked; pause and elicit in Linear.
+export const AskQuestionRequest = z.object({
+  contractVersion: z.literal(CONTRACT_VERSION),
+  jobId: z.string().min(1),
+  linearSessionId: z.string().min(1),
+  questionId: z.string().min(1),     // mini-generated; correlates the answer back
+  questions: z.array(AgentQuestion).min(1),
+});
+export type AskQuestionRequest = z.infer<typeof AskQuestionRequest>;
+
+export const AskQuestionResponse = z.object({ ack: z.literal(true) });
+export type AskQuestionResponse = z.infer<typeof AskQuestionResponse>;
+
+// Vercel → Mini: POST /jobs/:id/answer. The user's answers, keyed by question text → chosen
+// label(s) (multiSelect joined by ", "), matching the SDK's expected updatedInput.answers.
+export const AnswerRequest = z.object({
+  contractVersion: z.literal(CONTRACT_VERSION),
+  questionId: z.string().min(1),
+  answers: z.record(z.string(), z.string()),
+});
+export type AnswerRequest = z.infer<typeof AnswerRequest>;
+
+export const AnswerResponse = z.object({
+  questionId: z.string().min(1),
+  delivered: z.boolean(),            // false if no pending question matched (stale/unknown)
+});
+export type AnswerResponse = z.infer<typeof AnswerResponse>;
+
+// questionHook — resumed by /api/mini/question; mirrors the request's payload fields.
+export const QuestionHookPayload = z.object({
+  jobId: z.string(),
+  questionId: z.string(),
+  questions: z.array(AgentQuestion),
+});
+export type QuestionHookPayload = z.infer<typeof QuestionHookPayload>;
+
 /* ─────────────────── Hook tokens (contract §3) ─────────────────── */
 
 // Both the workflow (which `create`s the hook) and the route (which `resume`s it) compute the
 // same token from data each already has. MUST stay pure functions of their inputs (no Date.now /
 // randomness) — they are recomputed on every workflow replay and must be identical each time.
-export const promptToken  = (linearSessionId: string) => `prompt:${linearSessionId}`;
-export const jobDoneToken = (jobId: string)           => `job:${jobId}`;
+export const promptToken   = (linearSessionId: string) => `prompt:${linearSessionId}`;
+export const jobDoneToken  = (jobId: string)           => `job:${jobId}`;
+export const questionToken = (jobId: string)           => `question:${jobId}`;

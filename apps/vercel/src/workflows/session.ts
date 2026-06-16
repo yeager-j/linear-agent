@@ -13,11 +13,14 @@ import { defineHook, sleep } from "workflow";
 import {
   JobDoneHookPayload,
   PromptHookPayload,
+  QuestionHookPayload,
+  type AgentQuestion,
   type JobKind,
   type JobDoneHookPayload as JobDoneHookPayloadT,
 } from "@/lib/contract";
-import { promptToken, jobDoneToken } from "@/lib/tokens";
+import { promptToken, jobDoneToken, questionToken } from "@/lib/tokens";
 import {
+  emitElicitation,
   emitElicitationSelect,
   emitError,
   emitResponse,
@@ -25,11 +28,18 @@ import {
   setExternalUrls,
   syncIssueToStarted,
 } from "@/lib/linear";
-import { abortJob, createJob, reapWorktree as reapMiniWorktree } from "@/lib/mini";
+import {
+  abortJob,
+  createJob,
+  deliverAnswer,
+  reapWorktree as reapMiniWorktree,
+} from "@/lib/mini";
 import { classifyIntent } from "@/lib/intent";
+import { answerFromReply, renderQuestion } from "@/lib/questions";
 import {
   ABORT_GRACE,
   JOB_TIMEOUT,
+  MAX_QUESTION_ROUNDS,
   MAX_REVISION_ROUNDS,
   SWEEP_NUDGE_AFTER,
   SWEEP_REAP_AFTER,
@@ -42,6 +52,10 @@ export const promptHook = defineHook({ schema: PromptHookPayload });
 
 // jobDoneHook — resumed by /api/mini/callback when a job reaches terminal status (token: job:<id>).
 export const jobDoneHook = defineHook({ schema: JobDoneHookPayload });
+
+// questionHook — resumed by /api/mini/question when the agent asks a mid-run AskUserQuestion
+// (token: question:<jobId>). Carries one or more questions answered together.
+export const questionHook = defineHook({ schema: QuestionHookPayload });
 
 /* ───────────────────────── Workflow input ───────────────────────── */
 
@@ -145,6 +159,36 @@ async function classifyIntentStep(payload: { text: string; selectValue?: string 
   return classifyIntent(payload);
 }
 
+// Emit one elicitation for an AgentQuestion (rendering logic lives in lib/questions.ts). IO step.
+async function emitQuestionStep(linearSessionId: string, q: AgentQuestion): Promise<void> {
+  "use step";
+  const r = renderQuestion(q);
+  if (r.mode === "select") {
+    await emitElicitationSelect(linearSessionId, r.body, r.options);
+  } else {
+    await emitElicitation(linearSessionId, r.body);
+  }
+}
+
+// Deliver collected answers back to the mini so the agent's run continues. BEST-EFFORT for
+// transport: throws on hard failure so the caller (workflow body) can surface a Linear error;
+// returns the parsed AnswerResponse otherwise.
+async function deliverAnswerStep(
+  jobId: string,
+  questionId: string,
+  answers: Record<string, string>,
+): Promise<void> {
+  "use step";
+  const res = await deliverAnswer(jobId, questionId, answers);
+  if (!res.delivered) {
+    // The mini had no pending question matching this id (stale/expired) — the agent likely
+    // already moved on. Surface it for debugging; the run continues either way.
+    console.warn(
+      `[question] answer for job ${jobId} (questionId=${questionId}) hit no pending question (delivered=false)`,
+    );
+  }
+}
+
 async function finalizeSuccess(linearSessionId: string, done: JobDoneHookPayloadT): Promise<void> {
   "use step";
   if (done.prUrl) {
@@ -171,46 +215,134 @@ async function finalizeStop(linearSessionId: string): Promise<void> {
  * the documented timeout pattern (vercel-workflows.md §7, workflow cookbook/timeouts).
  */
 
+// Result of waiting on a running job. `question` is handled INSIDE the loop below and never
+// surfaces to callers; callers see only done / stop / timeout.
 type WaitJobResult =
-  | { kind: "done"; value: JobDoneHookPayloadT }
-  | { kind: "timeout" };
-
-// Wait for a job's terminal callback, bounded by JOB_TIMEOUT so a silently dead mini surfaces as
-// a Linear error instead of a run paused forever.
-async function waitForJob(jobId: string): Promise<WaitJobResult> {
-  using done = jobDoneHook.create({ token: jobDoneToken(jobId) });
-  // MUST `return await` (not `return`): a bare `return Promise.race(...)` exits this scope
-  // synchronously, so `using` disposes the hook the instant the race is built — before the
-  // callback can resume it. Awaiting keeps the hook alive until the race settles.
-  return await Promise.race([
-    (async (): Promise<WaitJobResult> => ({ kind: "done", value: await done }))(),
-    sleep(JOB_TIMEOUT).then((): WaitJobResult => ({ kind: "timeout" })),
-  ]);
-}
-
-type WaitJobOrStopResult =
   | { kind: "done"; value: JobDoneHookPayloadT }
   | { kind: "stop" }
   | { kind: "timeout" };
 
-// Execute phase: race the job's completion against a stop signal and the timeout backstop, so a
-// stop request works mid-run, not just between phases (plan §5/§7, contract §5 stop path).
-async function waitForJobOrStop(jobId: string, linearSessionId: string): Promise<WaitJobOrStopResult> {
+// One race iteration over a running job. Races the terminal callback (jobDoneHook) against a
+// mid-run question (questionHook), the JOB_TIMEOUT backstop, and — when withStop — a stop signal
+// (promptHook). All hooks live in this scope; the `Promise.race` is `await`ed inside it so `using`
+// keeps them alive until it settles (the disposal-timing bug we hit before).
+type RaceOutcome =
+  | { kind: "done"; value: JobDoneHookPayloadT }
+  | { kind: "question"; jobId: string; questionId: string; questions: AgentQuestion[] }
+  | { kind: "stop" }
+  | { kind: "timeout" };
+
+// Wait for a running job to finish, handling any mid-run AskUserQuestion(s) along the way.
+// withStop=true also lets a stop signal short-circuit the wait (execute phase). On a question:
+// elicit + collect in Linear, deliver the answers to the mini, then loop and wait again.
+//
+// B1 FIX (structural): the questionHook is created ONCE and lives for the ENTIRE loop — including
+// while we handle a question — so there is no unregistered window where a rapid second question
+// would be dropped. We consume successive questions from a single long-lived async iterator
+// (hooks are AsyncIterable, like the stop hook), racing its .next() against the other branches
+// each round WITHOUT disposing it between questions. The JOB_TIMEOUT is a single budget for the
+// whole wait (not reset per question), which is the desired backstop. All of this stays inside
+// the `using` scope so the hooks remain registered; the `Promise.race` is awaited within it.
+async function waitForJob(
+  jobId: string,
+  linearSessionId: string,
+  opts: { withStop: boolean; issueId?: string },
+): Promise<WaitJobResult> {
   using done = jobDoneHook.create({ token: jobDoneToken(jobId) });
+  using question = questionHook.create({ token: questionToken(jobId) });
   using stop = promptHook.create({ token: promptToken(linearSessionId) });
-  // `return await` (not bare `return`) so `using` keeps both hooks alive until the race settles
-  // — see waitForJob for why a bare return disposes them before they can be resumed.
-  return await Promise.race([
-    (async (): Promise<WaitJobOrStopResult> => ({ kind: "done", value: await done }))(),
-    (async (): Promise<WaitJobOrStopResult> => {
-      // Only a stop signal short-circuits the execute; non-stop prompts during execute are ignored.
-      for await (const msg of stop) {
-        if (msg.signal === "stop") return { kind: "stop" };
-      }
-      return { kind: "timeout" }; // iterator exhausted (won't normally happen)
-    })(),
-    sleep(JOB_TIMEOUT).then((): WaitJobOrStopResult => ({ kind: "timeout" })),
-  ]);
+
+  // Long-lived iterators: calling .next() again yields the NEXT resume on the same registered
+  // hook, so the question hook is never unregistered between questions.
+  const questionIter = question[Symbol.asyncIterator]();
+  const stopIter = stop[Symbol.asyncIterator]();
+
+  // Hoist each long-lived branch's pending promise OUTSIDE the loop. After a race, refresh ONLY
+  // the branch that resolved (the question branch) — never re-pull an iterator whose previous
+  // .next() is still pending, and never re-await a hook mid-flight. The losers stay pending and
+  // are reused on the next round. The timeout is a single budget for the whole wait.
+  const doneBranch: Promise<RaceOutcome> = (async () => ({ kind: "done", value: await done }))();
+  const timeoutBranch: Promise<RaceOutcome> = sleep(JOB_TIMEOUT).then(() => ({ kind: "timeout" }));
+  const stopBranch: Promise<RaceOutcome> = opts.withStop
+    ? (async (): Promise<RaceOutcome> => {
+        // Only a stop signal short-circuits; drain non-stop messages so a stale non-stop value
+        // can't permanently win the race.
+        while (true) {
+          const { value, done: end } = await stopIter.next();
+          if (end || !value) return { kind: "timeout" };
+          if (value.signal === "stop") return { kind: "stop" };
+        }
+      })()
+    : new Promise<RaceOutcome>(() => {}); // never resolves when stop isn't wanted
+
+  const nextQuestion = (): Promise<RaceOutcome> =>
+    (async (): Promise<RaceOutcome> => {
+      const { value, done: end } = await questionIter.next();
+      if (end || !value) return { kind: "timeout" }; // iterator exhausted (won't normally happen)
+      return {
+        kind: "question",
+        jobId: value.jobId,
+        questionId: value.questionId,
+        questions: value.questions,
+      };
+    })();
+
+  let questionBranch = nextQuestion();
+  let questionRounds = 0;
+  while (true) {
+    // MUST `await` inside the `using` scope — a bare `return Promise.race(...)` would dispose the
+    // hooks the instant the race is built, before any resume can land.
+    const outcome = await Promise.race([doneBranch, questionBranch, stopBranch, timeoutBranch]);
+
+    if (outcome.kind === "done") return { kind: "done", value: outcome.value };
+    if (outcome.kind === "stop") return { kind: "stop" };
+    if (outcome.kind === "timeout") return { kind: "timeout" };
+
+    // outcome.kind === "question" — handle it WITHOUT disposing the question hook, so a second
+    // question that arrives during handling is buffered by the still-registered hook and picked
+    // up by the next questionIter.next() below.
+    questionRounds += 1;
+    if (questionRounds > MAX_QUESTION_ROUNDS) {
+      await emitThought(
+        linearSessionId,
+        "Too many clarifying questions in a row — stopping to avoid a loop.",
+      );
+      return { kind: "timeout" };
+    }
+
+    const asked = await askQuestionsViaLinear(linearSessionId, outcome.questions, opts.issueId);
+    if (asked.kind === "stop") return { kind: "stop" };
+    await deliverAnswerStep(outcome.jobId, outcome.questionId, asked.answers);
+
+    // Re-arm ONLY the question branch; done/stop/timeout keep their pending promises.
+    questionBranch = nextQuestion();
+  }
+}
+
+/* ───────────────────────── AskUserQuestion elicitation (workflow body helper) ─────────────────────────
+ * Emits one elicitation per question, collects each answer (select value or free text), and builds
+ * the answers map keyed by question text → chosen label(s). A stop reply propagates up so the
+ * caller can abort the job. The per-question wait reuses the sweeper so an unanswered question
+ * can't hang the run forever.
+ */
+
+type AskResult = { kind: "answers"; answers: Record<string, string> } | { kind: "stop" };
+
+async function askQuestionsViaLinear(
+  linearSessionId: string,
+  questions: AgentQuestion[],
+  issueId?: string,
+): Promise<AskResult> {
+  const answers: Record<string, string> = {};
+  for (const q of questions) {
+    await emitQuestionStep(linearSessionId, q);
+    const reply = await waitForPromptWithSweeper(linearSessionId, issueId);
+    if (reply.kind === "stop") return { kind: "stop" };
+    // Normalized per the contract: single-select → option label; multiSelect → matched labels
+    // joined by ", " (fallback to raw text). Keyed by the question text.
+    answers[q.question] = answerFromReply(q, reply.value);
+  }
+  return { kind: "answers", answers };
 }
 
 type PromptResult =
@@ -261,7 +393,16 @@ export async function sessionWorkflow(input: SessionInput): Promise<void> {
 
   // PLAN
   let job = await startMiniJob({ kind: "plan", round: 0, input });
-  let done = await waitForJob(job.jobId);
+  let done = await waitForJob(job.jobId, input.linearSessionId, {
+    withStop: true,
+    issueId: input.issueId,
+  });
+  if (done.kind === "stop") {
+    await abortMiniJob(job.jobId);
+    await sleep(ABORT_GRACE);
+    await finalizeStop(input.linearSessionId);
+    return;
+  }
   if (done.kind === "timeout") {
     await finalizeError(input.linearSessionId, "The planning job timed out. Please try again.");
     return;
@@ -304,7 +445,16 @@ export async function sessionWorkflow(input: SessionInput): Promise<void> {
       feedback: msg.value.text,
       claudeSessionId,
     });
-    done = await waitForJob(job.jobId);
+    done = await waitForJob(job.jobId, input.linearSessionId, {
+      withStop: true,
+      issueId: input.issueId,
+    });
+    if (done.kind === "stop") {
+      await abortMiniJob(job.jobId);
+      await sleep(ABORT_GRACE);
+      await finalizeStop(input.linearSessionId);
+      return;
+    }
     if (done.kind === "timeout") {
       await finalizeError(input.linearSessionId, "The revision job timed out. Please try again.");
       return;
@@ -321,7 +471,10 @@ export async function sessionWorkflow(input: SessionInput): Promise<void> {
 
   // EXECUTE
   const execJob = await startMiniJob({ kind: "execute", round: 0, input, claudeSessionId });
-  const result = await waitForJobOrStop(execJob.jobId, input.linearSessionId);
+  const result = await waitForJob(execJob.jobId, input.linearSessionId, {
+    withStop: true,
+    issueId: input.issueId,
+  });
   if (result.kind === "stop") {
     await abortMiniJob(execJob.jobId);
     await sleep(ABORT_GRACE); // brief grace for the abort callback (best-effort)

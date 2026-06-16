@@ -4,17 +4,21 @@
 import { realQuery, type QueryFn } from "../sdk.ts";
 import { makeLinearClient, type LinearClient } from "../linear.ts";
 import { prepareWorkspace as realPrepareWorkspace, type Workspace, type PrepareOptions } from "../workspace/index.ts";
+import { sendQuestion as realSendQuestion } from "../question-client.ts";
+import type { SendQuestionFn } from "./question-handler.ts";
 
 export interface RunnerDeps {
   query: QueryFn;
   makeLinear: () => LinearClient;
   prepareWorkspace: (opts: PrepareOptions) => Promise<Workspace>;
+  sendQuestion: SendQuestionFn;
 }
 
 let _deps: RunnerDeps = {
   query: realQuery,
   makeLinear: () => makeLinearClient(),
   prepareWorkspace: realPrepareWorkspace,
+  sendQuestion: realSendQuestion,
 };
 
 export function runnerDeps(): RunnerDeps {

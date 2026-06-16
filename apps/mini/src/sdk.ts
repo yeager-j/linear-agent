@@ -8,6 +8,15 @@
 
 import type { SDKLikeMessage } from "./activity-bridge.ts";
 
+// Mirrors the SDK's CanUseTool callback. Fires for tool calls; for AskUserQuestion the handler
+// returns { behavior:"allow", updatedInput:{ ...input, answers } } to feed the user's answers
+// back to the agent. Async with NO timeout — it may block on our Vercel round-trip.
+export type CanUseToolFn = (
+  toolName: string,
+  input: Record<string, unknown>,
+  options?: { signal: AbortSignal },
+) => Promise<{ behavior: "allow"; updatedInput?: Record<string, unknown> } | { behavior: "deny"; message: string }>;
+
 export interface QueryParams {
   prompt: string;
   cwd: string;
@@ -17,6 +26,7 @@ export interface QueryParams {
   resume?: string; // claude session id to resume
   abortController?: AbortController;
   maxTurns?: number;
+  canUseTool?: CanUseToolFn;
 }
 
 // A query runner returns an async iterable of SDK-like messages.
@@ -37,6 +47,10 @@ export const realQuery: QueryFn = (params) => {
         resume: params.resume,
         abortController: params.abortController,
         maxTurns: params.maxTurns,
+        // The SDK's CanUseTool passes options.{signal,...}; our handler only needs the signal.
+        canUseTool: params.canUseTool
+          ? (toolName, input, options) => params.canUseTool!(toolName, input, { signal: options.signal })
+          : undefined,
       },
     });
     for await (const msg of iter) {

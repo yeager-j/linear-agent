@@ -110,3 +110,33 @@ describe("reapWorktree", () => {
     );
   });
 });
+
+describe("deliverAnswer", () => {
+  it("posts to /jobs/:id/answer with CF-Access headers + {contractVersion, questionId, answers}", async () => {
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(jsonResponse({ questionId: "q1", delivered: true }));
+
+    const answers = { "Which database?": "Postgres" };
+    const res = await mini.deliverAnswer("job_1", "q1", answers);
+    expect(res).toEqual({ questionId: "q1", delivered: true });
+
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("https://mini.example.com/jobs/job_1/answer");
+    const headers = init!.headers as Record<string, string>;
+    expect(headers["CF-Access-Client-Id"]).toBe("cf-id");
+    expect(headers["CF-Access-Client-Secret"]).toBe("cf-secret");
+    const sent = JSON.parse(init!.body as string);
+    expect(sent).toEqual({ contractVersion: CONTRACT_VERSION, questionId: "q1", answers });
+  });
+
+  it("treats a 409 as fatal-no-retry (ContractVersionMismatchError, single fetch)", async () => {
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(jsonResponse({ error: "contract-version-mismatch", contractVersion: "9.9.9" }, 409));
+    await expect(mini.deliverAnswer("job_1", "q1", {})).rejects.toBeInstanceOf(
+      mini.ContractVersionMismatchError,
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+});

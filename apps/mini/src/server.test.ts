@@ -167,6 +167,66 @@ describe("POST /jobs/reap", () => {
   });
 });
 
+describe("POST /jobs/:id/answer", () => {
+  const answerBody = (overrides: Record<string, unknown> = {}) => ({
+    contractVersion: "1.0.0",
+    questionId: "q1",
+    answers: { "Which DB?": "Postgres" },
+    ...overrides,
+  });
+
+  test("delivers answers to a pending question (delivered:true)", async () => {
+    const { registerQuestion, pendingCount } = await import("./questions.ts");
+    const app = createApp({ database: d, runner: () => new Promise(() => {}) });
+    const p = registerQuestion("q1", "job-x");
+    const res = await app.handleAnswer("job-x", postJson("/jobs/job-x/answer", answerBody()));
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { questionId: string; delivered: boolean };
+    expect(body.questionId).toBe("q1");
+    expect(body.delivered).toBe(true);
+    await expect(p).resolves.toEqual({ "Which DB?": "Postgres" });
+    expect(pendingCount()).toBe(0);
+  });
+
+  test("unknown/stale question => delivered:false, still 200", async () => {
+    const app = createApp({ database: d, runner: () => new Promise(() => {}) });
+    const res = await app.handleAnswer("job-x", postJson("/jobs/job-x/answer", answerBody({ questionId: "ghost" })));
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { delivered: boolean }).delivered).toBe(false);
+  });
+
+  test("409 on contract version mismatch (with contractVersion in body)", async () => {
+    const app = createApp({ database: d, runner: () => new Promise(() => {}) });
+    const res = await app.handleAnswer("job-x", postJson("/jobs/job-x/answer", answerBody({ contractVersion: "9.9.9" })));
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as { error: string; contractVersion: string };
+    expect(body.error).toBe("contract-version-mismatch");
+    expect(body.contractVersion).toBe("1.0.0");
+  });
+
+  test("400 on missing questionId", async () => {
+    const app = createApp({ database: d, runner: () => new Promise(() => {}) });
+    const res = await app.handleAnswer("job-x", postJson("/jobs/job-x/answer", { contractVersion: "1.0.0", answers: {} }));
+    expect(res.status).toBe(400);
+  });
+
+  test("403 when CF Access enforced and headers missing", async () => {
+    testConfig({ enforceCfAccess: true, cfAccessClientId: "id", cfAccessClientSecret: "sec" });
+    const app = createApp({ database: d, runner: () => new Promise(() => {}) });
+    const res = await app.handleAnswer("job-x", postJson("/jobs/job-x/answer", answerBody({ questionId: "x" })));
+    expect(res.status).toBe(403);
+  });
+
+  test("routes via fetch dispatcher (distinct from /abort)", async () => {
+    const { registerQuestion } = await import("./questions.ts");
+    const app = createApp({ database: d, runner: () => new Promise(() => {}) });
+    registerQuestion("q-route", "job-y");
+    const res = await app.fetch(postJson("/jobs/job-y/answer", answerBody({ questionId: "q-route" })));
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { delivered: boolean }).delivered).toBe(true);
+  });
+});
+
 describe("GET /healthz", () => {
   test("reports shape", async () => {
     testConfig({ maxConcurrentExecutions: 2 });

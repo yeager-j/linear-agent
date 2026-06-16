@@ -26,13 +26,16 @@ Mini   ──(LINEAR_ACCESS_TOKEN)──► Linear  agentActivityCreate / agentS
 | `src/contract.ts` | THE SEAM — verbatim zod schemas + `CONTRACT_VERSION` + hook tokens |
 | `src/config.ts` | env-driven config (Bun auto-loads `.env`), dry-run/gating flags |
 | `src/db.ts` | `bun:sqlite` — `jobs`, `workspaces`, `callbacks` (outbox) tables |
-| `src/server.ts` | `Bun.serve` routes: `/jobs`, `/jobs/reap`, `/jobs/:id/abort`, `/healthz` (validate/auth/dedupe) |
+| `src/server.ts` | `Bun.serve` routes: `/jobs`, `/jobs/reap`, `/jobs/:id/abort`, `/jobs/:id/answer`, `/healthz` |
 | `src/jobctl.ts` | in-memory registry: AbortControllers, concurrency cap + self-starting queue |
 | `src/callback.ts` | terminal callback to Vercel with retry/backoff + persistent outbox |
 | `src/reconcile.ts` | boot reconciliation: stuck `running` → `failed`/`"interrupted"` callback |
 | `src/linear.ts` | the ONE Linear GraphQL module (defensive against preview-API drift) |
 | `src/activity-bridge.ts` | SDK message stream → Linear thought/action/plan, throttle + heartbeat |
-| `src/sdk.ts` | thin seam over `@anthropic-ai/claude-agent-sdk` `query()` |
+| `src/sdk.ts` | thin seam over `@anthropic-ai/claude-agent-sdk` `query()` (incl. `canUseTool`) |
+| `src/questions.ts` | pending-question registry for mid-run AskUserQuestion HITL |
+| `src/question-client.ts` | `sendQuestion` → Vercel `POST /api/mini/question` (bearer, retry, fatal 409) |
+| `src/runners/question-handler.ts` | builds the `canUseTool` handler (AskUserQuestion → ask Vercel → resume) |
 | `src/runners/plan.ts` | plan / revise runs (`permissionMode: "plan"`, revise resumes the session) |
 | `src/runners/execute.ts` | execute run (`permissionMode: "dontAsk"` + allowlist) → commit → PR |
 | `src/workspace/` | bare clones + per-session worktrees, fetch mutex, prune/gc |
@@ -100,3 +103,9 @@ back to the dedicated user's Claude subscription login (see `ops/setup.md`).
   dropped from the outbox immediately, never retried.
 - Jobs found `running` at boot are reported `failed`/`"interrupted"` so the workflow's hook
   resumes instead of hanging.
+- Mid-run **AskUserQuestion** (plan AND execute): the SDK `canUseTool` callback intercepts the
+  tool, the run pauses, the mini `POST`s the question to Vercel (`/api/mini/question`, bearer,
+  bounded retry, fatal 409), and blocks until `POST /jobs/:id/answer` delivers the answers
+  (keyed by question text). `AskUserQuestion` is in `allowedTools` for both runners. A stop
+  during a pending question rejects it (`rejectQuestionsForJob` via the abort path) so the run
+  aborts cleanly instead of hanging.

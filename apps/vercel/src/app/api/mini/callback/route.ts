@@ -5,24 +5,13 @@
 // idempotently — a duplicate jobId resumes an already-consumed token, which throws
 // HookNotFoundError and is treated as a 200 no-op (contract §4/§7).
 
-import crypto from "node:crypto";
 import { resumeHook } from "workflow/api";
 import { HookNotFoundError } from "workflow/errors";
 import { CONTRACT_VERSION, MiniCallback, type JobDoneHookPayload } from "@/lib/contract";
-import { env } from "@/lib/env";
+import { bearerOk } from "@/lib/auth";
 import { jobDoneToken } from "@/lib/tokens";
 
 export const runtime = "nodejs";
-
-function bearerOk(header: string | null): boolean {
-  if (!header) return false;
-  const prefix = "Bearer ";
-  if (!header.startsWith(prefix)) return false;
-  const presented = Buffer.from(header.slice(prefix.length));
-  const expected = Buffer.from(env.callbackSecret());
-  // Length check first so timingSafeEqual doesn't throw on unequal lengths.
-  return presented.length === expected.length && crypto.timingSafeEqual(presented, expected);
-}
 
 export async function POST(request: Request): Promise<Response> {
   // 1) Auth.
