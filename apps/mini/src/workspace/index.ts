@@ -103,6 +103,21 @@ export async function prepareWorkspace(opts: PrepareOptions): Promise<Workspace>
   const branch = branchName(opts.issueIdentifier, opts.linearSessionId);
 
   await ensureBareClone(opts.repoUrl, barePath);
+
+  // Guard: the base branch MUST resolve in the bare clone. If it doesn't (empty repo, or a
+  // default branch that isn't `baseBranch`), `git worktree add -B <branch> <path> <base>` would
+  // silently create an UNBORN branch — the agent's first commit becomes a root commit with no
+  // ancestry to the base, and the PR fails with "no history in common with main". Fail loudly.
+  const baseCheck = await $`git --git-dir=${barePath} rev-parse --verify --quiet ${`refs/heads/${baseBranch}`}`
+    .nothrow()
+    .quiet();
+  if (baseCheck.exitCode !== 0) {
+    throw new Error(
+      `base branch '${baseBranch}' not found in ${opts.repoUrl} — the repo may be empty or its ` +
+        `default branch is not '${baseBranch}'. Push an initial commit (or set PR_BASE_BRANCH) and retry.`,
+    );
+  }
+
   await mkdir(join(worktreePath, ".."), { recursive: true });
 
   const existing = getWorkspace(d, opts.linearSessionId);

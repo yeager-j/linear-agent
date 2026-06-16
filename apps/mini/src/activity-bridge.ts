@@ -80,6 +80,7 @@ export async function bridgeStream(
 
   let claudeSessionId: string | undefined;
   let resultText: string | undefined;
+  let planText: string | undefined; // authoritative plan captured from ExitPlanMode's input
   let isError = false;
 
   let lastActivityAt = now();
@@ -120,6 +121,12 @@ export async function bridgeStream(
             const body = (block.text ?? block.thinking ?? "").trim();
             if (body && !throttled()) await linear.thought(linearSessionId, body, true);
           } else if (blockType === "tool_use" && block.name) {
+            // ExitPlanMode carries the real plan in its `plan` input — capture it verbatim as the
+            // authoritative plan text (the streamed thoughts are ephemeral and vanish on terminal).
+            if (block.name === "ExitPlanMode" || block.name === "exit_plan_mode") {
+              const p = (block.input as { plan?: unknown } | undefined)?.plan;
+              if (typeof p === "string" && p.trim()) planText = p.trim();
+            }
             const param = summarizeInput(block.input);
             await linear.action(linearSessionId, block.name, param, undefined, true);
             actionsSeen.push(param ? `${block.name}: ${param}` : block.name);
@@ -152,5 +159,6 @@ export async function bridgeStream(
     clearInterval(heartbeat);
   }
 
-  return { claudeSessionId, resultText, isError };
+  // Prefer the verbatim ExitPlanMode plan over the SDK's free-form result text for plan runs.
+  return { claudeSessionId, resultText: planText ?? resultText, isError };
 }

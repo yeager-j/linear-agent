@@ -101,16 +101,18 @@ async function ackThought(linearSessionId: string, body: string): Promise<void> 
   await emitThought(linearSessionId, body);
 }
 
-async function sendElicitation(linearSessionId: string): Promise<void> {
+async function sendElicitation(linearSessionId: string, planSummary?: string): Promise<void> {
   "use step";
-  await emitElicitationSelect(
-    linearSessionId,
-    "I've finished planning. Approve this plan, or describe the changes you'd like.",
-    [
-      { label: "Approve", value: "approve" },
-      { label: "Request changes", value: "request_changes" },
-    ],
-  );
+  // Include the plan IN the (durable) elicitation: the streamed plan thoughts are ephemeral and
+  // vanish when the plan run goes terminal, so without this the user sees only the buttons.
+  const plan = planSummary?.trim();
+  const body = plan
+    ? `${plan}\n\n---\n\n**Approve** this plan to start work, or **Request changes** (or just reply) to tell me what to adjust.`
+    : "I've finished planning. Approve this plan, or describe the changes you'd like.";
+  await emitElicitationSelect(linearSessionId, body, [
+    { label: "Approve", value: "approve" },
+    { label: "Request changes", value: "request_changes" },
+  ]);
 }
 
 async function nudge(linearSessionId: string): Promise<void> {
@@ -276,7 +278,7 @@ export async function sessionWorkflow(input: SessionInput): Promise<void> {
   // APPROVAL LOOP
   let round = 0;
   while (true) {
-    await sendElicitation(input.linearSessionId);
+    await sendElicitation(input.linearSessionId, done.value.planSummary);
     const msg = await waitForPromptWithSweeper(input.linearSessionId, input.issueId);
     if (msg.kind === "stop") {
       await finalizeStop(input.linearSessionId);
