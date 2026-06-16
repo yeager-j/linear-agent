@@ -62,7 +62,8 @@ describe("bridgeStream mapping", () => {
     expect(outcome.resultText).toBe("Plan:\n1. do X");
     expect(outcome.isError).toBe(false);
     expect(rec.thoughts.map((t) => t.body)).toContain("Looking at auth");
-    expect(rec.thoughts.every((t) => t.ephemeral === true)).toBe(true);
+    // Assistant text is the agent's actual message -> persisted DURABLY (survives the final response).
+    expect(rec.thoughts.find((t) => t.body === "Looking at auth")?.ephemeral).toBe(false);
     expect(rec.actions[0]).toEqual({ action: "Read", parameter: "src/auth.ts" });
     // A plan checklist was published when the tool_use happened, with the confirmed item shape:
     // { content, status } and camelCase statuses.
@@ -95,21 +96,39 @@ describe("bridgeStream mapping", () => {
     expect(outcome.resultText).toBe("ran out");
   });
 
-  test("throttle collapses rapid thoughts", async () => {
+  test("throttle collapses rapid (ephemeral) thinking", async () => {
     testConfig({ activityThrottleMs: 100000, heartbeatIntervalMs: 60_000 });
     const { client, rec } = recordingLinear();
     let t = 1000;
     await bridgeStream(
       fromArray([
-        { type: "assistant", message: { content: [{ type: "text", text: "a" }] } },
-        { type: "assistant", message: { content: [{ type: "text", text: "b" }] } },
-        { type: "assistant", message: { content: [{ type: "text", text: "c" }] } },
+        { type: "assistant", message: { content: [{ type: "thinking", thinking: "a" }] } },
+        { type: "assistant", message: { content: [{ type: "thinking", thinking: "b" }] } },
+        { type: "assistant", message: { content: [{ type: "thinking", thinking: "c" }] } },
         { type: "result", subtype: "success", result: "done" },
       ]),
       { linear: client, linearSessionId: "s1", now: () => t },
     );
-    // With a huge throttle window and a fixed clock, only the first thought passes.
+    // Throttle only gates ephemeral thinking. With a huge window + fixed clock, only the first passes.
     expect(rec.thoughts.length).toBe(1);
+    expect(rec.thoughts[0]?.ephemeral).toBe(true);
+    void t;
+  });
+
+  test("durable text messages are never throttled (don't drop real messages)", async () => {
+    testConfig({ activityThrottleMs: 100000, heartbeatIntervalMs: 60_000 });
+    const { client, rec } = recordingLinear();
+    let t = 1000;
+    await bridgeStream(
+      fromArray([
+        { type: "assistant", message: { content: [{ type: "text", text: "msg 1" }] } },
+        { type: "assistant", message: { content: [{ type: "text", text: "msg 2" }] } },
+        { type: "result", subtype: "success", result: "done" },
+      ]),
+      { linear: client, linearSessionId: "s1", now: () => t },
+    );
+    expect(rec.thoughts.map((x) => x.body)).toEqual(["msg 1", "msg 2"]);
+    expect(rec.thoughts.every((x) => x.ephemeral === false)).toBe(true);
     void t;
   });
 

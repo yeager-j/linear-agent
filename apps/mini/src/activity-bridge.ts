@@ -117,8 +117,14 @@ export async function bridgeStream(
       if (msg.type === "assistant" && msg.message?.content) {
         for (const block of msg.message.content) {
           const blockType = block.type ?? (block.thinking ? "thinking" : block.text ? "text" : undefined);
-          if (blockType === "text" || blockType === "thinking") {
-            const body = (block.text ?? block.thinking ?? "").trim();
+          if (blockType === "text") {
+            // The agent's actual messages — persist them DURABLY so the conversation survives the
+            // terminal response (for later discussion). Not throttled: never drop a real message.
+            const body = (block.text ?? "").trim();
+            if (body) await linear.thought(linearSessionId, body, false);
+          } else if (blockType === "thinking") {
+            // Internal reasoning — ephemeral live progress, throttled to avoid hammering the API.
+            const body = (block.thinking ?? "").trim();
             if (body && !throttled()) await linear.thought(linearSessionId, body, true);
           } else if (blockType === "tool_use" && block.name) {
             // ExitPlanMode carries the real plan in its `plan` input — capture it verbatim as the
