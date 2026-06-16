@@ -1,0 +1,205 @@
+// Workspace management (plan §4 Phase 3): one bare clone per repo, one git worktree per Linear
+// session. Worktrees give each job an isolated checkout that shares object storage with the
+// bare clone, so plan/revise/execute for a session reuse the same tree.
+//
+// Layout under WORK_ROOT:
+//   repos/<slug>.git           bare clone (fetched, shared)
+//   worktrees/<linearSessionId>  per-session worktree
+//
+// Concurrency: fetches into a shared bare repo are serialized by a per-bare-path mutex so two
+// jobs don't race `git fetch` on the same object store.
+
+import { $ } from "bun";
+import { mkdir, rm, readdir } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
+import { config } from "../config.ts";
+import { db, upsertWorkspace, getWorkspace, deleteWorkspace, allWorkspaces, type WorkspaceRow } from "../db.ts";
+import type { Database } from "bun:sqlite";
+import { log } from "../log.ts";
+
+export interface Workspace {
+  linearSessionId: string;
+  repoUrl: string;
+  barePath: string;
+  worktreePath: string;
+  branch: string;
+}
+
+export interface PrepareOptions {
+  linearSessionId: string;
+  issueIdentifier: string;
+  repoUrl: string;
+  baseBranch?: string; // branch to base the worktree on (default config.prBaseBranch)
+  database?: Database;
+}
+
+// Per-bare-path fetch mutex: serialize all git operations that touch a shared bare repo so two
+// jobs don't race `git fetch`/`worktree add` on the same object store. Each call chains onto
+// the previous tail; the tail always resolves (errors are swallowed for the *waiter*, not the
+// caller — the caller's own fn result/error is returned as-is).
+const fetchTails = new Map<string, Promise<void>>();
+
+async function withFetchLock<T>(barePath: string, fn: () => Promise<T>): Promise<T> {
+  const prevTail = fetchTails.get(barePath) ?? Promise.resolve();
+  let releaseTail!: () => void;
+  const myTail = new Promise<void>((res) => (releaseTail = res));
+  fetchTails.set(barePath, myTail);
+
+  await prevTail; // wait my turn (predecessor tail always resolves)
+  try {
+    return await fn();
+  } finally {
+    releaseTail();
+    if (fetchTails.get(barePath) === myTail) fetchTails.delete(barePath);
+  }
+}
+
+// Derive a filesystem-safe slug from a repo URL (e.g. git@github.com:o/r.git -> o__r).
+export function repoSlug(repoUrl: string): string {
+  const stripped = repoUrl
+    .replace(/^https?:\/\//, "")
+    .replace(/^git@/, "")
+    .replace(/:/g, "/")
+    .replace(/\.git$/, "");
+  const parts = stripped.split("/").filter(Boolean);
+  const tail = parts.slice(-2).join("__");
+  return (tail || "repo").replace(/[^a-zA-Z0-9_.-]/g, "-");
+}
+
+// Sanitize a Linear session id for use as a directory name.
+function sessionDir(linearSessionId: string): string {
+  return linearSessionId.replace(/[^a-zA-Z0-9_.-]/g, "-");
+}
+
+function paths(repoUrl: string, linearSessionId: string) {
+  const root = config().workRoot;
+  const barePath = join(root, "repos", `${repoSlug(repoUrl)}.git`);
+  const worktreePath = join(root, "worktrees", sessionDir(linearSessionId));
+  return { root, barePath, worktreePath };
+}
+
+// Ensure a bare clone exists and is up to date. Serialized per bare path.
+async function ensureBareClone(repoUrl: string, barePath: string): Promise<void> {
+  await mkdir(join(barePath, ".."), { recursive: true });
+  await withFetchLock(barePath, async () => {
+    if (!existsSync(barePath)) {
+      log.info("bare clone", { repoUrl, barePath });
+      await $`git clone --bare ${repoUrl} ${barePath}`.quiet();
+    } else {
+      log.debug("bare fetch", { barePath });
+      // A bare clone keeps upstream heads under refs/heads/* (no origin/* remote-tracking).
+      // Mirror that on fetch so the base ref stays a plain branch name.
+      await $`git --git-dir=${barePath} fetch --prune origin "+refs/heads/*:refs/heads/*"`.quiet();
+    }
+  });
+}
+
+// Prepare (create or reuse) the worktree for a session. Returns paths + the branch name.
+export async function prepareWorkspace(opts: PrepareOptions): Promise<Workspace> {
+  const d = opts.database ?? db();
+  const baseBranch = opts.baseBranch ?? config().prBaseBranch;
+  const { barePath, worktreePath } = paths(opts.repoUrl, opts.linearSessionId);
+  const branch = branchName(opts.issueIdentifier, opts.linearSessionId);
+
+  await ensureBareClone(opts.repoUrl, barePath);
+  await mkdir(join(worktreePath, ".."), { recursive: true });
+
+  const existing = getWorkspace(d, opts.linearSessionId);
+  if (existing && existsSync(existing.worktree_path)) {
+    log.info("reusing worktree", { worktreePath: existing.worktree_path });
+    return {
+      linearSessionId: opts.linearSessionId,
+      repoUrl: existing.repo_url,
+      barePath: existing.bare_path,
+      worktreePath: existing.worktree_path,
+      branch: existing.branch ?? branch,
+    };
+  }
+
+  // Fresh worktree on a new branch off the base branch (serialized: worktree add touches the
+  // bare repo's refs/worktrees).
+  await withFetchLock(barePath, async () => {
+    if (existsSync(worktreePath)) {
+      await $`git --git-dir=${barePath} worktree remove --force ${worktreePath}`.quiet().nothrow();
+      await rm(worktreePath, { recursive: true, force: true });
+    }
+    // Base ref is a plain branch name in the bare repo's refs/heads/* (see fetch refspec).
+    await $`git --git-dir=${barePath} worktree add -B ${branch} ${worktreePath} ${baseBranch}`.quiet();
+  });
+
+  upsertWorkspace(d, {
+    linear_session_id: opts.linearSessionId,
+    repo_url: opts.repoUrl,
+    bare_path: barePath,
+    worktree_path: worktreePath,
+    branch,
+  });
+
+  return {
+    linearSessionId: opts.linearSessionId,
+    repoUrl: opts.repoUrl,
+    barePath,
+    worktreePath,
+    branch,
+  };
+}
+
+// Branch naming: agent/<issue>-<short-session>. Stable per session.
+export function branchName(issueIdentifier: string, linearSessionId: string): string {
+  const issue = issueIdentifier.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+  const short = linearSessionId.replace(/[^a-zA-Z0-9]/g, "").slice(0, 8);
+  return `agent/${issue}-${short}`;
+}
+
+// Reap a session's worktree (Phase 7 sweeper / post-execute cleanup). Keeps the bare clone
+// and the job row's claude_session_id intact (only the `workspaces` registry row is removed),
+// so a late reply can recreate the worktree and resume the Claude session. This only frees disk.
+// Returns true if a worktree was actually removed; false if there was nothing to reap (no-op),
+// which the /jobs/reap endpoint surfaces as reaped:false.
+export async function reapWorktree(linearSessionId: string, database?: Database): Promise<boolean> {
+  const d = database ?? db();
+  const ws = getWorkspace(d, linearSessionId);
+  if (!ws) return false;
+  await withFetchLock(ws.bare_path, async () => {
+    await $`git --git-dir=${ws.bare_path} worktree remove --force ${ws.worktree_path}`.quiet().nothrow();
+  });
+  await rm(ws.worktree_path, { recursive: true, force: true });
+  deleteWorkspace(d, linearSessionId);
+  log.info("reaped worktree", { linearSessionId, worktreePath: ws.worktree_path });
+  return true;
+}
+
+// Prune stale worktree admin entries and (optionally) GC bare repos. Best-effort.
+export async function pruneAndGc(database?: Database): Promise<void> {
+  const d = database ?? db();
+  const seenBare = new Set<string>();
+  for (const ws of allWorkspaces(d)) {
+    if (seenBare.has(ws.bare_path)) continue;
+    seenBare.add(ws.bare_path);
+    await withFetchLock(ws.bare_path, async () => {
+      await $`git --git-dir=${ws.bare_path} worktree prune`.quiet().nothrow();
+      await $`git --git-dir=${ws.bare_path} gc --auto`.quiet().nothrow();
+    });
+  }
+  // Drop DB rows whose worktree dir no longer exists.
+  for (const ws of allWorkspaces(d)) {
+    if (!existsSync(ws.worktree_path)) deleteWorkspace(d, ws.linear_session_id);
+  }
+}
+
+// Test/inspection helper.
+export async function listWorktreeDirs(database?: Database): Promise<string[]> {
+  const d = database ?? db();
+  return allWorkspaces(d)
+    .map((w: WorkspaceRow) => w.worktree_path)
+    .filter((p) => existsSync(p));
+}
+
+// Exposed for tests that need the computed paths.
+export function computePaths(repoUrl: string, linearSessionId: string) {
+  return paths(repoUrl, linearSessionId);
+}
+
+// Re-export so callers don't reach into node:fs.
+export { readdir };

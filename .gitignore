@@ -1,0 +1,32 @@
+# dependencies
+node_modules/
+.pnp
+.pnp.*
+
+# turborepo
+.turbo/
+
+# builds
+dist/
+.next/
+out/
+*.tsbuildinfo
+next-env.d.ts
+
+# env / secrets
+.env
+.env.*
+!.env.example
+
+# runtime data (mini)
+*.db
+*.db-shm
+*.db-wal
+work/
+
+# logs
+*.log
+npm-debug.log*
+
+# os
+.DS_Store

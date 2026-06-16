@@ -1,0 +1,28 @@
+# Cloudflare Tunnel config for exposing the mini to Vercel only (plan §1, §4 Phase 0).
+#
+# STATUS: STUB / TEMPLATE.
+#
+# Topology (integration-contract §0): Vercel reaches the mini over a Cloudflare Tunnel, locked
+# with a Cloudflare Access SERVICE TOKEN. Vercel sends CF-Access-Client-Id / CF-Access-Client-Secret
+# on every request to /jobs, /jobs/:id/abort, /healthz; anything without a valid token is rejected
+# at Cloudflare's edge (403) and never reaches the mini. The mini is never publicly reachable.
+#
+# Setup TODO:
+#   1. `cloudflared tunnel login` and `cloudflared tunnel create agent-jobs`.
+#   2. Fill in <TUNNEL_UUID> and the hostname below; create the DNS route:
+#        cloudflared tunnel route dns agent-jobs agent-jobs.yourdomain.com
+#   3. In the Cloudflare Zero Trust dashboard:
+#        - Create an Access application for agent-jobs.yourdomain.com.
+#        - Create a SERVICE TOKEN; put its client id/secret in Vercel env (CF_ACCESS_*).
+#        - Add an Access policy allowing ONLY that service token.
+#   4. Run as a service: `cloudflared service install` (or a launchd plist alongside the mini's).
+#   5. Optionally set ENFORCE_CF_ACCESS=1 on the mini for defense-in-depth (it will also check
+#      the CF-Access headers itself).
+
+tunnel: <TUNNEL_UUID>
+credentials-file: /Users/linearagent/.cloudflared/<TUNNEL_UUID>.json   # TODO
+
+ingress:
+  - hostname: agent-jobs.yourdomain.com    # TODO
+    service: http://localhost:3001
+  - service: http_status:404

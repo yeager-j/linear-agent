@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd service for the linear-agent-mini job runner (plan §4 Phase 0).
+
+  STATUS: STUB / TEMPLATE. Adjust the paths and the user before loading.
+
+  Install (as the dedicated `linearagent` user):
+    cp ops/com.linearagent.mini.plist ~/Library/LaunchAgents/
+    # edit the absolute paths + EnvironmentVariables below
+    launchctl load -w ~/Library/LaunchAgents/com.linearagent.mini.plist
+
+  TODO:
+    - Point ProgramArguments at the absolute `bun` path and this repo's index.ts.
+    - Set WorkingDirectory to the checkout location.
+    - Put secrets in a 0600 .env next to index.ts (Bun auto-loads it) rather than inline here,
+      OR list them under EnvironmentVariables. Do NOT set ANTHROPIC_API_KEY (subscription auth).
+    - Keep KeepAlive true so launchd restarts the runner; boot reconciliation will report any
+      jobs that were mid-flight when it died.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.linearagent.mini</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/bun</string>            <!-- TODO: absolute path to bun -->
+    <string>/Users/linearagent/linear-agent-mini/index.ts</string> <!-- TODO -->
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/linearagent/linear-agent-mini</string> <!-- TODO -->
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PORT</key><string>3001</string>
+    <key>WORK_ROOT</key><string>/Users/linearagent/work</string>
+    <!-- TODO: LINEAR_ACCESS_TOKEN, GITHUB_TOKEN, VERCEL_CALLBACK_URL, CALLBACK_SECRET,
+         CF_ACCESS_* (if ENFORCE_CF_ACCESS), MAX_CONCURRENT_EXECUTIONS, DEFAULT_REPO_URL.
+         Prefer a 0600 .env file over inlining secrets here. -->
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/linearagent/Library/Logs/linear-agent-mini.out.log</string> <!-- TODO -->
+  <key>StandardErrorPath</key>
+  <string>/Users/linearagent/Library/Logs/linear-agent-mini.err.log</string> <!-- TODO -->
+</dict>
+</plist>
