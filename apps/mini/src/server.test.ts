@@ -1,6 +1,6 @@
 import { test, expect, describe, beforeEach } from "bun:test";
 import { createApp } from "./server.ts";
-import { freshDb, testConfig, mockFetch, createJobBody, postJson } from "./test-helpers.ts";
+import { freshDb, testConfig, mockFetch, createJobBody, postJson, getAuthed } from "./test-helpers.ts";
 import type { Database } from "bun:sqlite";
 import { getJob } from "./db.ts";
 import type { Runner } from "./jobctl.ts";
@@ -231,11 +231,82 @@ describe("GET /healthz", () => {
   test("reports shape", async () => {
     testConfig({ maxConcurrentExecutions: 2 });
     const app = createApp({ database: d, runner: () => new Promise(() => {}) });
-    const res = app.handleHealthz();
+    const res = app.handleHealthz(getAuthed("/healthz"));
     const body = (await res.json()) as { ok: boolean; runningJobs: number; maxConcurrentExecutions: number };
     expect(body.ok).toBe(true);
     expect(body.maxConcurrentExecutions).toBe(2);
     expect(typeof body.runningJobs).toBe("number");
+  });
+});
+
+describe("bearer auth (SEC-1)", () => {
+  test("401 when the bearer is missing or wrong, on every endpoint", async () => {
+    const app = createApp({ database: d, runner: () => new Promise(() => {}) });
+    const wrong = { Authorization: "Bearer nope" };
+    const missing = { Authorization: "" };
+    for (const headers of [wrong, missing]) {
+      expect((await app.handleCreateJob(postJson("/jobs", createJobBody(), headers))).status).toBe(401);
+      expect((await app.handleAbort("j", postJson("/jobs/j/abort", {}, headers))).status).toBe(401);
+      expect(
+        (await app.handleReap(postJson("/jobs/reap", { contractVersion: "1.0.0", linearSessionId: "s" }, headers)))
+          .status,
+      ).toBe(401);
+      expect((app.handleHealthz(getAuthed("/healthz", headers))).status).toBe(401);
+    }
+    // A request with no Authorization header at all is also rejected.
+    const bare = new Request("http://mini.test/jobs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(createJobBody()),
+    });
+    expect((await app.handleCreateJob(bare)).status).toBe(401);
+  });
+
+  test("fails CLOSED: 401 even with a valid CF token when MINI_AUTH_SECRET is unset", async () => {
+    testConfig({ miniAuthSecret: undefined });
+    const app = createApp({ database: d, runner: () => new Promise(() => {}) });
+    const res = await app.handleCreateJob(postJson("/jobs", createJobBody()));
+    expect(res.status).toBe(401);
+  });
+});
+
+describe("CF Access fail-closed (SEC-3)", () => {
+  test("403 when ENFORCE_CF_ACCESS is on but the CF tokens are unconfigured", async () => {
+    testConfig({ enforceCfAccess: true, cfAccessClientId: undefined, cfAccessClientSecret: undefined });
+    const app = createApp({ database: d, runner: () => new Promise(() => {}) });
+    // Valid bearer (postJson default) so we reach the CF check; it must NOT silently allow-all.
+    const res = await app.handleCreateJob(postJson("/jobs", createJobBody()));
+    expect(res.status).toBe(403);
+  });
+});
+
+describe("idempotency-key conflict (SEC-5)", () => {
+  test("409 when the same key is reused for a different session/kind", async () => {
+    const app = createApp({ database: d, runner: () => new Promise(() => {}) });
+    await app.handleCreateJob(postJson("/jobs", createJobBody({ idempotencyKey: "shared:key" })));
+    const res = await app.handleCreateJob(
+      postJson("/jobs", createJobBody({ linearSessionId: "different", idempotencyKey: "shared:key" })),
+    );
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as { error: string }).error).toBe("idempotency-key-conflict");
+  });
+});
+
+describe("answer is bound to its jobId (SEC-6)", () => {
+  test("an answer for the wrong jobId does not resolve another job's question", async () => {
+    const { registerQuestion, pendingCount, rejectQuestionsForJob } = await import("./questions.ts");
+    const app = createApp({ database: d, runner: () => new Promise(() => {}) });
+    const before = pendingCount();
+    const p = registerQuestion("q-sec6", "job-A");
+    p.catch(() => {}); // avoid an unhandled rejection when we clean up below
+    const res = await app.handleAnswer(
+      "job-B",
+      postJson("/jobs/job-B/answer", { contractVersion: "1.0.0", questionId: "q-sec6", answers: { Q: "A" } }),
+    );
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { delivered: boolean }).delivered).toBe(false);
+    expect(pendingCount()).toBe(before + 1); // still pending — not resolved by the wrong job
+    rejectQuestionsForJob("job-A"); // cleanup so the global registry doesn't leak into other tests
   });
 });
 
@@ -259,6 +330,27 @@ describe("fetch dispatcher + end-to-end callback", () => {
     // Outbox cleared on 2xx.
     const { getCallback } = await import("./db.ts");
     expect(getCallback(d, jobId)).toBeNull();
+  });
+
+  test("re-fires the terminal callback on an idempotent create for a finished job (BUG-6)", async () => {
+    const mf = mockFetch();
+    const m = manualRunner();
+    const app = createApp({ database: d, runner: m.runner, fetchImpl: mf.fn });
+    const created = await app.fetch(postJson("/jobs", createJobBody()));
+    const { jobId } = (await created.json()) as { jobId: string };
+
+    m.finish({ status: "succeeded", planSummary: "done" });
+    await Bun.sleep(20);
+    const firstCount = mf.calls.filter((c) => (c.body as { jobId?: string })?.jobId === jobId).length;
+    expect(firstCount).toBeGreaterThanOrEqual(1);
+
+    // Re-create with the SAME idempotency key: the job is already terminal, so the callback is
+    // re-delivered (covers the lost-create-response + lost-callback case).
+    const again = await app.fetch(postJson("/jobs", createJobBody()));
+    expect(again.status).toBe(200);
+    await Bun.sleep(20);
+    const secondCount = mf.calls.filter((c) => (c.body as { jobId?: string })?.jobId === jobId).length;
+    expect(secondCount).toBeGreaterThan(firstCount);
   });
 
   test("DRY_RUN fake job flows start -> succeeded callback", async () => {

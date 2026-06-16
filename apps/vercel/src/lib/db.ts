@@ -33,6 +33,12 @@ export async function claimDelivery(deliveryId: string): Promise<boolean> {
   return Array.isArray(rows) && rows.length > 0;
 }
 
+// Undo a claim when processing failed before any durable side effect (e.g. start() threw), so
+// Linear's retry of the SAME delivery re-processes it instead of seeing a phantom duplicate.
+export async function releaseDelivery(deliveryId: string): Promise<void> {
+  await sql()`DELETE FROM webhook_deliveries WHERE delivery_id = ${deliveryId}`;
+}
+
 /* ───────────────────────── Session map ───────────────────────── */
 
 export async function insertSession(params: {

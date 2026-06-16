@@ -31,6 +31,8 @@ class ContractVersionMismatchError extends Error {
 function miniHeaders(): Record<string, string> {
   return {
     "Content-Type": "application/json",
+    // App-layer bearer the mini enforces on every endpoint (constant-time, fails closed).
+    Authorization: `Bearer ${env.miniAuthSecret()}`,
     // Cloudflare Access service token (contract §2). Missing/invalid => 403 at the edge.
     "CF-Access-Client-Id": env.cfAccessClientId(),
     "CF-Access-Client-Secret": env.cfAccessClientSecret(),

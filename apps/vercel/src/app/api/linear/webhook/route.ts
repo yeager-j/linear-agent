@@ -8,7 +8,7 @@
 import { start } from "workflow/api";
 import { HookNotFoundError } from "workflow/errors";
 import { promptHook, sessionWorkflow, type SessionInput } from "@/workflows/session";
-import { claimDelivery, insertSession } from "@/lib/db";
+import { claimDelivery, getSession, insertSession, releaseDelivery } from "@/lib/db";
 import { isTimestampFresh, verifyLinearSignature, emitThought } from "@/lib/linear";
 import { getDeliveryId, parseWebhook } from "@/lib/webhook";
 import { promptToken } from "@/lib/tokens";
@@ -54,12 +54,14 @@ export async function POST(request: Request): Promise<Response> {
     return new Response("stale", { status: 202 });
   }
 
-  // 3) Dedupe BEFORE start/resume. A missing delivery id can't be deduped — process it (the
-  //    signature already proved authenticity); workflow-side idempotency is the backstop.
+  // 3) Dedupe BEFORE start/resume. A missing delivery id can't be deduped here — the per-session
+  //    guard below (getSession before start) is the backstop for that case (contract §4).
   const deliveryId = getDeliveryId(request.headers, body);
+  let claimedDeliveryId: string | null = null;
   if (deliveryId) {
     const fresh = await claimDelivery(deliveryId);
     if (!fresh) return Response.json({ ok: true, deduped: true });
+    claimedDeliveryId = deliveryId;
   }
 
   const parsed = parseWebhook(body);
@@ -67,6 +69,12 @@ export async function POST(request: Request): Promise<Response> {
   try {
     if (parsed.action === "created") {
       if (!parsed.linearSessionId) return new Response("missing session id", { status: 400 });
+
+      // Per-session dedupe: a second `created` for the same session (re-delivery with a new id, or
+      // re-delegation) must not spawn a second run. Covers the no-delivery-id case too.
+      if (await getSession(parsed.linearSessionId)) {
+        return Response.json({ ok: true, deduped: true });
+      }
 
       // Ack thought within 10s (one GraphQL call) so the session isn't marked unresponsive.
       await emitThought(parsed.linearSessionId, `Looking into ${parsed.issueIdentifier}…`).catch(
@@ -79,29 +87,46 @@ export async function POST(request: Request): Promise<Response> {
         issueIdentifier: parsed.issueIdentifier,
         promptContext: parsed.promptContext,
       };
-      const run = await start(sessionWorkflow, [input]);
+
+      let run: { runId: string };
+      try {
+        run = await start(sessionWorkflow, [input]);
+      } catch (err) {
+        // No run was created — release the dedupe claim so Linear's retry re-processes instead of
+        // seeing a phantom duplicate and dropping the session forever.
+        if (claimedDeliveryId) await releaseDelivery(claimedDeliveryId).catch(() => {});
+        throw err;
+      }
+      // The run is live; the session row is best-effort metadata + the per-session dedupe key. If
+      // it fails to write, the same-delivery claim still prevents a duplicate run on retry.
       await insertSession({
         linearSessionId: parsed.linearSessionId,
         workflowRunId: run.runId,
         issueIdentifier: parsed.issueIdentifier,
-      });
+      }).catch((err) => console.error("[webhook] insertSession failed (run already started)", err));
       return Response.json({ ok: true, runId: run.runId });
     }
 
     if (parsed.action === "prompted") {
       if (!parsed.linearSessionId) return new Response("missing session id", { status: 400 });
+      // Only resume sessions this app actually started (ownership gate). An event for an unknown
+      // session is accepted-and-ignored rather than blindly resuming a hook.
+      if (!(await getSession(parsed.linearSessionId))) {
+        return Response.json({ ok: true, ignored: "unknown-session" });
+      }
       const resumed = await resumePromptWithRetry(parsed.linearSessionId, {
         text: parsed.text,
         selectValue: parsed.selectValue,
         signal: parsed.signal,
       });
-      // No active hook (session already finished, or never started) -> accept and ignore.
+      // No active hook (session already finished) -> accept and ignore.
       return Response.json({ ok: true, resumed });
     }
 
     if (parsed.action === "stop") {
-      // Defensive standalone stop: deliver as a stop signal to the prompt hook.
-      if (parsed.linearSessionId) {
+      // Defensive standalone stop: deliver as a stop signal to the prompt hook (only for a session
+      // we started).
+      if (parsed.linearSessionId && (await getSession(parsed.linearSessionId))) {
         await resumePromptWithRetry(parsed.linearSessionId, { text: "", signal: "stop" });
       }
       return Response.json({ ok: true });

@@ -32,6 +32,23 @@ describe("reconcileOnBoot", () => {
     expect((cb.body as { reason: string }).reason).toBe("interrupted");
   });
 
+  test("the interrupt callback carries the job's claudeSessionId for continuity (TEST-6)", async () => {
+    insertJob(d, {
+      job_id: "j3",
+      linear_session_id: "s3",
+      issue_identifier: "ENG-3",
+      kind: "execute",
+      idempotency_key: "s3:execute:0",
+      claude_session_id: "claude-abc",
+      status: "running",
+    });
+    const mf = mockFetch();
+    await reconcileOnBoot({ database: d, fetchImpl: mf.fn });
+    const cb = mf.calls.find((c) => (c.body as { jobId?: string })?.jobId === "j3")!;
+    expect(cb).toBeTruthy();
+    expect((cb.body as { claudeSessionId?: string }).claudeSessionId).toBe("claude-abc");
+  });
+
   test("leaves non-running jobs alone", async () => {
     insertJob(d, {
       job_id: "j2",

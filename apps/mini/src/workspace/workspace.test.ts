@@ -46,6 +46,16 @@ describe("repoSlug + branchName", () => {
     expect(repoSlug("git@github.com:acme/widgets.git")).toBe("acme__widgets");
     expect(repoSlug("https://github.com/acme/widgets")).toBe("acme__widgets");
   });
+  test("computePaths rejects a traversal-y session id (BUG-7)", () => {
+    // `.` / `..` survive the char filter and would resolve the worktree to (or above) the
+    // worktrees root, which then reaches a recursive rm. They must throw, not compute a path.
+    expect(() => computePaths(originUrl, ".")).toThrow();
+    expect(() => computePaths(originUrl, "..")).toThrow();
+    // A normal id still computes a path inside the worktrees root.
+    const p = computePaths(originUrl, "sess_1");
+    expect(p.worktreePath.startsWith(join(workRoot, "worktrees"))).toBe(true);
+  });
+
   test("branch name is stable + sanitized", () => {
     const b = branchName("ENG-123", "sess_ABC-xyz/1");
     expect(b.startsWith("agent/eng-123-")).toBe(true);

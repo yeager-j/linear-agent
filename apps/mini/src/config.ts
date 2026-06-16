@@ -24,6 +24,10 @@ export interface Config {
   vercelCallbackUrl: string | undefined;
   callbackSecret: string | undefined;
 
+  // App-layer auth: shared bearer secret Vercel must present on EVERY mini request. Independent
+  // of Cloudflare Access — every endpoint fails closed when this is unset (see server.ts authOk).
+  miniAuthSecret: string | undefined;
+
   // Seam: Cloudflare Access (defense-in-depth; Cloudflare already enforces at the edge)
   cfAccessClientId: string | undefined;
   cfAccessClientSecret: string | undefined;
@@ -66,6 +70,8 @@ export function loadConfig(): Config {
 
     vercelCallbackUrl: process.env.VERCEL_CALLBACK_URL,
     callbackSecret: process.env.CALLBACK_SECRET,
+
+    miniAuthSecret: process.env.MINI_AUTH_SECRET,
 
     cfAccessClientId: process.env.CF_ACCESS_CLIENT_ID,
     cfAccessClientSecret: process.env.CF_ACCESS_CLIENT_SECRET,

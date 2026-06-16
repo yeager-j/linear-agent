@@ -1,9 +1,14 @@
 // POST /api/mini/callback — terminal job status from the mini.
 //
 // Contract: require `Authorization: Bearer <CALLBACK_SECRET>` with a constant-time compare
-// (contract §2); reject unknown contractVersion with 409 (D8); resume jobDoneHook(`job:${jobId}`)
-// idempotently — a duplicate jobId resumes an already-consumed token, which throws
-// HookNotFoundError and is treated as a 200 no-op (contract §4/§7).
+// (contract §2); reject unknown contractVersion with 409 (D8); resume jobDoneHook(`job:${jobId}`).
+// A HookNotFoundError has two causes that we can't distinguish here: the hook isn't registered YET
+// (a fast job — DRY_RUN, or a synchronous early-return like "no repo configured" — can call back
+// before waitForJob creates the hook, since start() returns before hooks register), or the token
+// is already consumed (a duplicate callback). We return a RETRYABLE 503 so the mini's bounded
+// backoff replays until the hook registers; a true duplicate simply exhausts those bounded retries
+// harmlessly (the workflow already moved on). Returning 200 here would silently drop the first
+// callback of a fast job and wedge the workflow until its 45-min timeout (contract §4/§7).
 
 import { resumeHook } from "workflow/api";
 import { HookNotFoundError } from "workflow/errors";
@@ -55,12 +60,17 @@ export async function POST(request: Request): Promise<Response> {
   try {
     await resumeHook(jobDoneToken(cb.jobId), payload);
   } catch (err) {
-    // Duplicate callback or job already finished -> token consumed -> no-op. Any 2xx tells the
-    // mini to stop retrying (contract §7).
-    if (!HookNotFoundError.is(err)) {
-      console.error("[callback] resume failed", err);
-      return new Response("internal error", { status: 500 });
+    if (HookNotFoundError.is(err)) {
+      // Hook not registered yet (early callback) or already consumed (duplicate). Ask the mini to
+      // retry: an early callback succeeds once waitForJob registers the hook; a duplicate just
+      // exhausts the mini's bounded retries. Either beats wedging the workflow for 45 minutes.
+      return Response.json(
+        { error: "no-active-job-hook", reason: "workflow not ready; retry" },
+        { status: 503 },
+      );
     }
+    console.error("[callback] resume failed", err);
+    return new Response("internal error", { status: 500 });
   }
 
   return Response.json({ ack: true });

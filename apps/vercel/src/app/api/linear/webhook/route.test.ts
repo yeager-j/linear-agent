@@ -7,7 +7,9 @@ const WEBHOOK_SECRET = "wh-secret";
 const start = vi.fn();
 const promptResume = vi.fn();
 const claimDelivery = vi.fn();
+const releaseDelivery = vi.fn();
 const insertSession = vi.fn();
+const getSession = vi.fn();
 const emitThought = vi.fn();
 
 class FakeHookNotFoundError extends Error {
@@ -24,7 +26,9 @@ vi.mock("@/workflows/session", () => ({
 }));
 vi.mock("@/lib/db", () => ({
   claimDelivery: (...a: unknown[]) => claimDelivery(...a),
+  releaseDelivery: (...a: unknown[]) => releaseDelivery(...a),
   insertSession: (...a: unknown[]) => insertSession(...a),
+  getSession: (...a: unknown[]) => getSession(...a),
 }));
 // Keep the real signature verification; stub only the network-touching helpers.
 vi.mock("@/lib/linear", async (importOriginal) => {
@@ -43,7 +47,9 @@ afterEach(() => {
   start.mockReset();
   promptResume.mockReset();
   claimDelivery.mockReset();
+  releaseDelivery.mockReset();
   insertSession.mockReset();
+  getSession.mockReset();
   emitThought.mockReset();
 });
 
@@ -53,11 +59,11 @@ function sign(body: string): string {
 
 function makeRequest(
   body: unknown,
-  opts: { sig?: string; delivery?: string } = {},
+  opts: { sig?: string; delivery?: string; noSig?: boolean } = {},
 ): Request {
   const raw = JSON.stringify(body);
   const headers: Record<string, string> = { "Content-Type": "application/json" };
-  headers["Linear-Signature"] = opts.sig ?? sign(raw);
+  if (!opts.noSig) headers["Linear-Signature"] = opts.sig ?? sign(raw);
   if (opts.delivery) headers["Linear-Delivery"] = opts.delivery;
   return new Request("https://app.example.com/api/linear/webhook", {
     method: "POST",
@@ -85,8 +91,63 @@ describe("POST /api/linear/webhook", () => {
     expect(start).not.toHaveBeenCalled();
   });
 
+  it("rejects a missing signature header with 401 (TEST-5)", async () => {
+    const res = await POST(makeRequest(createdBody, { noSig: true }));
+    expect(res.status).toBe(401);
+    expect(start).not.toHaveBeenCalled();
+  });
+
+  it("processes a created event with no delivery id via the per-session guard (TEST-5/BUG-5)", async () => {
+    // No Linear-Delivery header and no webhookId → undedupable by delivery id. claimDelivery must
+    // be skipped and the per-session getSession guard is the backstop; a fresh session still starts.
+    getSession.mockResolvedValue(null);
+    start.mockResolvedValue({ runId: "run_x" });
+    emitThought.mockResolvedValue(undefined);
+    insertSession.mockResolvedValue(undefined);
+    const res = await POST(makeRequest(createdBody)); // no delivery option
+    expect(res.status).toBe(200);
+    expect(claimDelivery).not.toHaveBeenCalled();
+    expect(start).toHaveBeenCalledTimes(1);
+  });
+
+  it("dedupes a second created for an already-started session (BUG-5)", async () => {
+    claimDelivery.mockResolvedValue(true); // a *new* delivery id
+    getSession.mockResolvedValue({ workflowRunId: "run_1", issueIdentifier: "ENG-1" });
+    const res = await POST(makeRequest(createdBody, { delivery: "del_new" }));
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ deduped: true });
+    expect(start).not.toHaveBeenCalled();
+  });
+
+  it("releases the delivery claim when start() throws so Linear's retry re-processes (BUG-1)", async () => {
+    claimDelivery.mockResolvedValue(true);
+    getSession.mockResolvedValue(null);
+    emitThought.mockResolvedValue(undefined);
+    start.mockRejectedValue(new Error("workflow start failed"));
+    const res = await POST(makeRequest(createdBody, { delivery: "del_fail" }));
+    expect(res.status).toBe(500);
+    expect(releaseDelivery).toHaveBeenCalledWith("del_fail");
+    expect(insertSession).not.toHaveBeenCalled();
+  });
+
+  it("ignores a prompted event for an unknown session (SEC-4 ownership gate)", async () => {
+    claimDelivery.mockResolvedValue(true);
+    getSession.mockResolvedValue(null); // not a session this app started
+    const body = {
+      action: "prompted",
+      webhookTimestamp: now,
+      agentSession: { id: "sess_unknown" },
+      agentActivity: { content: { body: "hello?" } },
+    };
+    const res = await POST(makeRequest(body, { delivery: "del_unk" }));
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ ignored: "unknown-session" });
+    expect(promptResume).not.toHaveBeenCalled();
+  });
+
   it("on created: acks, starts the workflow, inserts the session row", async () => {
     claimDelivery.mockResolvedValue(true);
+    getSession.mockResolvedValue(null); // no existing run for this session
     start.mockResolvedValue({ runId: "run_1" });
     emitThought.mockResolvedValue(undefined);
     insertSession.mockResolvedValue(undefined);
@@ -116,6 +177,7 @@ describe("POST /api/linear/webhook", () => {
 
   it("on prompted: resumes the promptHook with text + selectValue", async () => {
     claimDelivery.mockResolvedValue(true);
+    getSession.mockResolvedValue({ workflowRunId: "run_1", issueIdentifier: "ENG-1" });
     promptResume.mockResolvedValue({ runId: "run_1" });
     const body = {
       action: "prompted",
@@ -133,6 +195,7 @@ describe("POST /api/linear/webhook", () => {
 
   it("on prompted with no active hook: acks with resumed=false", async () => {
     claimDelivery.mockResolvedValue(true);
+    getSession.mockResolvedValue({ workflowRunId: "run_1", issueIdentifier: "ENG-1" });
     promptResume.mockRejectedValue(new FakeHookNotFoundError("no listener"));
     const body = {
       action: "prompted",
@@ -147,6 +210,7 @@ describe("POST /api/linear/webhook", () => {
 
   it("routes a stop signal on a prompted event to the hook", async () => {
     claimDelivery.mockResolvedValue(true);
+    getSession.mockResolvedValue({ workflowRunId: "run_1", issueIdentifier: "ENG-1" });
     promptResume.mockResolvedValue({ runId: "run_1" });
     const body = {
       action: "prompted",

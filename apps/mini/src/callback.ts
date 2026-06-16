@@ -8,7 +8,7 @@
 //     `callbacks` outbox so a boot replay can finish delivery if the process dies.
 
 import { config } from "./config.ts";
-import { db, upsertCallback, bumpCallbackAttempt, deleteCallback, dueCallbacks } from "./db.ts";
+import { db, upsertCallback, bumpCallbackAttempt, deleteCallback, dueCallbacks, getCallback } from "./db.ts";
 import type { Database } from "bun:sqlite";
 import { CONTRACT_VERSION, MiniCallback } from "./contract.ts";
 import { log } from "./log.ts";
@@ -41,7 +41,7 @@ export async function sendCallback(
 // Attempt one delivery of a queued callback. On success: remove from outbox. On failure:
 // schedule the next attempt (the boot replayer / a periodic flush will pick it up).
 async function attemptDelivery(d: Database, jobId: string, fetchImpl: typeof fetch): Promise<boolean> {
-  const row = db_getCallback(d, jobId);
+  const row = getCallback(d, jobId);
   if (!row) return true; // already delivered
   const cfg = config();
 
@@ -82,21 +82,21 @@ async function attemptDelivery(d: Database, jobId: string, fetchImpl: typeof fet
 
   const attempts = row.attempts + 1;
   if (attempts >= MAX_ATTEMPTS) {
-    log.error("callback exceeded max attempts; dropping from outbox", { jobId, attempts });
+    // Log the terminal details (esp. prUrl/branch) so a dropped success isn't undiscoverable: the
+    // PR may already be open while Vercel never learned, and the workflow will report a timeout.
+    let detail: Record<string, unknown> = {};
+    try {
+      const p = JSON.parse(row.payload) as Partial<MiniCallback>;
+      detail = { status: p.status, kind: p.kind, prUrl: p.prUrl, branch: p.branch };
+    } catch {
+      // payload unparseable — log what we have
+    }
+    log.error("callback exceeded max attempts; dropping from outbox", { jobId, attempts, ...detail });
     deleteCallback(d, jobId);
     return false;
   }
   bumpCallbackAttempt(d, jobId, Date.now() + backoff(attempts));
   return false;
-}
-
-// Local import shim so tests can pass a db without the singleton.
-function db_getCallback(d: Database, jobId: string) {
-  return (
-    d.query(`SELECT * FROM callbacks WHERE job_id = $id`).get({ id: jobId }) as
-      | import("./db.ts").CallbackRow
-      | null
-  );
 }
 
 // Replay any undelivered callbacks whose next_attempt_at is due. Called on boot and can be

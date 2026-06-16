@@ -13,6 +13,7 @@ import { z } from "zod";
 import { db } from "./db.ts";
 import type { Database } from "bun:sqlite";
 import { config } from "./config.ts";
+import { bearerTokenMatches, timingSafeEqualStr } from "./auth.ts";
 import { log } from "./log.ts";
 import {
   CONTRACT_VERSION,
@@ -25,7 +26,8 @@ import {
   type ReapWorktreeResponse,
   type AnswerResponse,
 } from "./contract.ts";
-import { getJob, getJobByIdempotencyKey, insertJob } from "./db.ts";
+import { getJob, getJobByIdempotencyKey, insertJob, toTerminalStatus } from "./db.ts";
+import { sendCallback } from "./callback.ts";
 import { JobController, type Runner } from "./jobctl.ts";
 import { makeRunner } from "./runners/index.ts";
 import { reapWorktree } from "./workspace/index.ts";
@@ -39,7 +41,7 @@ export interface App {
   handleAbort(jobId: string, req: Request): Promise<Response>;
   handleReap(req: Request): Promise<Response>;
   handleAnswer(jobId: string, req: Request): Promise<Response>;
-  handleHealthz(): Response;
+  handleHealthz(req: Request): Response;
   fetch(req: Request): Promise<Response>;
 }
 
@@ -68,16 +70,34 @@ function hasVersionMismatch(raw: unknown): boolean {
   );
 }
 
+// Primary app-layer auth: every endpoint requires `Authorization: Bearer <MINI_AUTH_SECRET>`,
+// compared in constant time. Fails CLOSED — when MINI_AUTH_SECRET is unset every request is
+// rejected, so a misconfigured mini never serves unauthenticated jobs (the endpoints drive the
+// Agent SDK + git/PR with real tokens). This is independent of Cloudflare Access.
+function bearerOk(req: Request): boolean {
+  return bearerTokenMatches(req.headers.get("authorization"), config().miniAuthSecret);
+}
+
 // Defense-in-depth: Cloudflare Access already enforces the service token at the edge, but if
 // ENFORCE_CF_ACCESS is set we additionally require matching headers (read both casings).
+// Fails CLOSED — if enforcement is requested but the tokens aren't configured, reject rather than
+// silently allow-all. Constant-time comparison, like bearerOk.
 function cfAccessOk(req: Request): boolean {
   const cfg = config();
   if (!cfg.enforceCfAccess) return true;
-  if (!cfg.cfAccessClientId || !cfg.cfAccessClientSecret) return true; // nothing to compare against
+  if (!cfg.cfAccessClientId || !cfg.cfAccessClientSecret) return false;
   const h = req.headers;
   const id = h.get("CF-Access-Client-Id") ?? h.get("cf-access-client-id");
   const secret = h.get("CF-Access-Client-Secret") ?? h.get("cf-access-client-secret");
-  return id === cfg.cfAccessClientId && secret === cfg.cfAccessClientSecret;
+  return timingSafeEqualStr(id, cfg.cfAccessClientId) && timingSafeEqualStr(secret, cfg.cfAccessClientSecret);
+}
+
+// Single auth gate for every endpoint: bearer first (401), then CF Access (403). Returns the
+// failing Response, or null when the request is authorized.
+function authDenied(req: Request): Response | null {
+  if (!bearerOk(req)) return json({ error: "unauthorized" }, 401);
+  if (!cfAccessOk(req)) return json({ error: "forbidden" }, 403);
+  return null;
 }
 
 export function createApp(deps: AppDeps = {}): App {
@@ -89,7 +109,8 @@ export function createApp(deps: AppDeps = {}): App {
   });
 
   async function handleCreateJob(req: Request): Promise<Response> {
-    if (!cfAccessOk(req)) return json({ error: "forbidden" }, 403);
+    const denied = authDenied(req);
+    if (denied) return denied;
 
     let raw: unknown;
     try {
@@ -108,9 +129,39 @@ export function createApp(deps: AppDeps = {}): App {
     }
     const body = parsed.data;
 
-    // Idempotency (contract D4): same key => same jobId, no second job.
+    // Idempotency (contract D4): same key => same jobId, no second job. Defense-in-depth: the key
+    // is attacker-derivable (`${sid}:${kind}:${round}`), so verify the rest of the body matches the
+    // stored job before echoing its id back — a mismatch means someone is reusing a key for a
+    // different request, which we reject rather than silently bind them to the existing job.
     const existing = getJobByIdempotencyKey(d, body.idempotencyKey);
     if (existing) {
+      if (existing.linear_session_id !== body.linearSessionId || existing.kind !== body.kind) {
+        log.warn("idempotency key reused for a different request; rejecting", {
+          idempotencyKey: body.idempotencyKey,
+        });
+        return json({ error: "idempotency-key-conflict" }, 409);
+      }
+      // If the job already reached a terminal state, re-fire its callback. A retried create means
+      // the original CreateJobResponse may have been lost; if the original callback was also lost,
+      // the workflow is waiting on a jobDoneHook that would otherwise never resume again. The
+      // outbox + Vercel-side dedupe make a redundant re-delivery harmless.
+      const terminal = toTerminalStatus(existing.status);
+      if (terminal) {
+        void sendCallback(
+          {
+            jobId: existing.job_id,
+            linearSessionId: existing.linear_session_id,
+            kind: existing.kind,
+            status: terminal,
+            prUrl: existing.pr_url ?? undefined,
+            branch: existing.branch ?? undefined,
+            planSummary: existing.plan_summary ?? undefined,
+            claudeSessionId: existing.claude_session_id ?? undefined,
+            reason: existing.reason ?? undefined,
+          },
+          { database: d, fetchImpl: deps.fetchImpl },
+        ).catch((err) => log.error("re-fire callback failed", { jobId: existing.job_id, err: String(err) }));
+      }
       log.info("idempotent /jobs hit", { idempotencyKey: body.idempotencyKey, jobId: existing.job_id });
       const queued = existing.status === "queued";
       const res: CreateJobResponse = { jobId: existing.job_id, queued };
@@ -136,7 +187,8 @@ export function createApp(deps: AppDeps = {}): App {
   }
 
   async function handleAbort(jobId: string, req: Request): Promise<Response> {
-    if (!cfAccessOk(req)) return json({ error: "forbidden" }, 403);
+    const denied = authDenied(req);
+    if (denied) return denied;
     const job = getJob(d, jobId);
     // Unknown or already-finished => no-op (contract: aborted:false). The eventual terminal
     // callback (for a live job) carries status:"aborted".
@@ -146,7 +198,8 @@ export function createApp(deps: AppDeps = {}): App {
   }
 
   async function handleReap(req: Request): Promise<Response> {
-    if (!cfAccessOk(req)) return json({ error: "forbidden" }, 403);
+    const denied = authDenied(req);
+    if (denied) return denied;
 
     let raw: unknown;
     try {
@@ -170,11 +223,13 @@ export function createApp(deps: AppDeps = {}): App {
   }
 
   // POST /jobs/:id/answer — Vercel delivers the user's answers to a pending mid-run question.
-  // The :id (jobId) is informational; the questionId in the body is the authoritative correlation
-  // key (a job may have asked, the run moved on, then a stale answer arrives). delivered=false if
-  // no pending question matched (stale/unknown), still 200.
-  async function handleAnswer(_jobId: string, req: Request): Promise<Response> {
-    if (!cfAccessOk(req)) return json({ error: "forbidden" }, 403);
+  // The questionId in the body is the primary correlation key (a job may have asked, the run moved
+  // on, then a stale answer arrives), but the :id (jobId) is enforced too: an answer only resolves
+  // a pending question that belongs to that job, so a wrong-job answer can't be honored.
+  // delivered=false if no pending question matched (stale/unknown/wrong-job), still 200.
+  async function handleAnswer(jobId: string, req: Request): Promise<Response> {
+    const denied = authDenied(req);
+    if (denied) return denied;
 
     let raw: unknown;
     try {
@@ -189,12 +244,14 @@ export function createApp(deps: AppDeps = {}): App {
       return json({ error: "validation", issues: z.treeifyError(parsed.error) }, 400);
     }
 
-    const delivered = resolveQuestion(parsed.data.questionId, parsed.data.answers);
+    const delivered = resolveQuestion(parsed.data.questionId, parsed.data.answers, jobId);
     const res: AnswerResponse = { questionId: parsed.data.questionId, delivered };
     return json(res, 200);
   }
 
-  function handleHealthz(): Response {
+  function handleHealthz(req: Request): Response {
+    const denied = authDenied(req);
+    if (denied) return denied;
     const res: HealthzResponse = {
       ok: true,
       runningJobs: controller.runningJobs(),
@@ -204,8 +261,8 @@ export function createApp(deps: AppDeps = {}): App {
     return json(res, 200);
   }
 
-  // Fallback dispatcher for environments/tests that drive a single fetch(). The real server
-  // uses Bun.serve routes (startServer), but this keeps everything addressable in one place.
+  // THE router: a single method+path dispatcher used by both the tests (via app.fetch) and the
+  // real server (startServer forwards Bun.serve to it), so every endpoint is declared exactly once.
   async function fetchHandler(req: Request): Promise<Response> {
     const url = new URL(req.url);
     const { pathname } = url;
@@ -215,7 +272,7 @@ export function createApp(deps: AppDeps = {}): App {
     if (req.method === "POST" && abortMatch) return handleAbort(decodeURIComponent(abortMatch[1]!), req);
     const answerMatch = pathname.match(/^\/jobs\/([^/]+)\/answer$/);
     if (req.method === "POST" && answerMatch) return handleAnswer(decodeURIComponent(answerMatch[1]!), req);
-    if (req.method === "GET" && pathname === "/healthz") return handleHealthz();
+    if (req.method === "GET" && pathname === "/healthz") return handleHealthz(req);
     return json({ error: "not-found" }, 404);
   }
 
@@ -233,30 +290,13 @@ export function createApp(deps: AppDeps = {}): App {
 export function startServer(deps: AppDeps = {}) {
   const app = createApp(deps);
   const server = Bun.serve({
+    // Bind loopback ONLY: the sole intended ingress is the co-located cloudflared daemon
+    // forwarding the tunnel to localhost. Never expose :3001 on the LAN/Tailscale interface,
+    // which would let an in-network peer bypass Cloudflare Access and hit /jobs directly.
+    hostname: "127.0.0.1",
     port: config().port,
-    routes: {
-      "/jobs": {
-        POST: (req) => app.handleCreateJob(req),
-      },
-      "/jobs/reap": {
-        POST: (req) => app.handleReap(req),
-      },
-      "/jobs/:id/abort": {
-        POST: (req) => app.handleAbort(req.params.id, req),
-      },
-      "/jobs/:id/answer": {
-        POST: (req) => app.handleAnswer(req.params.id, req),
-      },
-      "/healthz": {
-        GET: () => app.handleHealthz(),
-      },
-    },
-    fetch() {
-      return new Response(JSON.stringify({ error: "not-found" }), {
-        status: 404,
-        headers: { "Content-Type": "application/json" },
-      });
-    },
+    // Forward every request to the single dispatcher (app.fetch) so routes live in one place.
+    fetch: (req) => app.fetch(req),
   });
   log.info("mini server listening", { url: String(server.url), contractVersion: CONTRACT_VERSION });
   return { app, server };

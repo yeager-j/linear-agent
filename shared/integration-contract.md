@@ -17,8 +17,8 @@ see `vercel-workflows.md`.
 ## 0. Topology recap
 
 ```
-Vercel  ──(Cloudflare Access service token)──►  Mini   POST /jobs, /jobs/:id/abort, POST /jobs/reap, GET /healthz
-Mini    ──(CALLBACK_SECRET bearer)──────────►  Vercel POST /api/mini/callback
+Vercel  ──(MINI_AUTH_SECRET bearer + CF Access token)──►  Mini   POST /jobs, /jobs/:id/abort, /jobs/:id/answer, /jobs/reap, GET /healthz
+Mini    ──(CALLBACK_SECRET bearer)─────────────────────►  Vercel POST /api/mini/callback, /api/mini/question
 ```
 - Vercel is the state machine (workflow + hooks). Mini is a dumb execution appliance.
 - Mini streams `thought`/`action`/`plan` activities **directly to Linear** during runs (not
@@ -184,18 +184,23 @@ export type JobDoneHookPayload = z.infer<typeof JobDoneHookPayload>;
 
 ## 2. Auth — exact headers, both directions
 
-### Vercel → Mini (Cloudflare Access service token)
-Cloudflare Access enforces these at the edge; the mini sits behind the tunnel and is never
-publicly reachable. Vercel MUST send on every request to `/jobs`, `/jobs/:id/abort`, `/healthz`:
+### Vercel → Mini (shared bearer + Cloudflare Access service token)
+The mini binds loopback only, so the sole network path in is the co-located cloudflared daemon.
+On top of that, Vercel MUST authenticate at the app layer on EVERY mini endpoint (`/jobs`,
+`/jobs/:id/abort`, `/jobs/:id/answer`, `/jobs/reap`, `/healthz`):
 
 ```
+Authorization:           Bearer <MINI_AUTH_SECRET>
 CF-Access-Client-Id:     <CF_ACCESS_CLIENT_ID>
 CF-Access-Client-Secret: <CF_ACCESS_CLIENT_SECRET>
 ```
-Missing/invalid → **403 at Cloudflare's edge** (request never reaches the mini). The mini does
-not need to validate these itself (Cloudflare already did), but MAY additionally require them as
-defense-in-depth. `⚠️ VERIFY` exact Cloudflare header casing — `CF-Access-Client-Id` /
-`CF-Access-Client-Secret` is the documented pair.
+The mini enforces the bearer itself with a constant-time compare and **fails closed**: a missing
+or wrong bearer → **401**, and an unset `MINI_AUTH_SECRET` rejects every request. This is
+independent of Cloudflare Access, so the mini is never unauthenticated even if the tunnel/edge is
+bypassed (e.g. on Tailscale/LAN) or misconfigured. The CF Access service token is additionally
+enforced at Cloudflare's edge (→ **403** before the mini) and, when `ENFORCE_CF_ACCESS=1`, by the
+mini too (also fail-closed: missing tokens → 403). `⚠️ VERIFY` exact Cloudflare header casing —
+`CF-Access-Client-Id` / `CF-Access-Client-Secret` is the documented pair.
 
 ### Mini → Vercel (shared secret)
 The mini MUST send on `POST /api/mini/callback`:
@@ -231,7 +236,7 @@ export const jobDoneToken = (jobId: string)           => `job:${jobId}`;
 |---|---|---|---|
 | Linear webhook | `Linear-Delivery` (UUID) — fallback `webhookId`+`webhookTimestamp` | Vercel | Neon insert-or-ignore BEFORE `start`/`resume` |
 | `POST /jobs` retry | `idempotencyKey` = `${linearSessionId}:${kind}:${round}` | Mini | return existing `jobId`, do not start a second job |
-| Mini→Vercel callback | `jobId` | Vercel | resume `jobDoneHook` at most once per jobId; duplicate → 200 `{ack:true}` no-op |
+| Mini→Vercel callback | `jobId` | Vercel | resume `jobDoneHook`; success → 200 `{ack:true}`. Hook not found (not registered yet, or already consumed) → retryable **503** so an early callback isn't dropped; the mini's bounded retries absorb a true duplicate |
 | `POST /jobs/:id/abort` | `jobId` | Mini | idempotent; unknown/finished → `aborted:false` |
 
 `round` is the revision-loop counter the workflow already tracks (0 for the first plan). It
@@ -284,6 +289,7 @@ racing promptHook(stop) against jobDoneHook so stop works mid-run.
 | `MINI_BASE_URL` | e.g. `https://agent-jobs.yourdomain.com` |
 | `CF_ACCESS_CLIENT_ID` | service token → tunnel (sent as `CF-Access-Client-Id`) |
 | `CF_ACCESS_CLIENT_SECRET` | service token → tunnel (sent as `CF-Access-Client-Secret`) |
+| `MINI_AUTH_SECRET` | bearer it presents on every mini request (`Authorization: Bearer …`) |
 | `CALLBACK_SECRET` | the bearer it expects on `/api/mini/callback` |
 | `DATABASE_URL` | Neon (session ↔ runId map, webhook dedupe) |
 
@@ -294,6 +300,7 @@ racing promptHook(stop) against jobDoneHook so stop works mid-run.
 | `GITHUB_TOKEN` | push + open PR (repo-scoped PAT) |
 | `VERCEL_CALLBACK_URL` | e.g. `https://your-app.vercel.app/api/mini/callback` |
 | `CALLBACK_SECRET` | the bearer it presents on the callback |
+| `MINI_AUTH_SECRET` | bearer it requires on every inbound request (fails closed if unset) |
 | `MAX_CONCURRENT_EXECUTIONS` | local concurrency cap (e.g. 2) |
 | `WORK_ROOT` | e.g. `/Users/linearagent/work` |
 
@@ -314,7 +321,9 @@ in code so a mismatch is a deploy-time signal, not a config drift).
   per-run key.
 - Timestamps, when present, are ISO-8601 UTC strings.
 - The mini NEVER sends non-terminal statuses to Vercel. The workflow NEVER polls the mini.
-- A 2xx from a callback means "accepted, stop retrying" — even if it was a dedup no-op.
+- A 2xx from a callback means "accepted, stop retrying". A **503** means "not ready, retry" (the
+  `jobDoneHook` isn't registered yet — fast jobs can call back before the workflow creates it); the
+  mini's bounded backoff replays until it lands. Only a 409 is fatal (see below).
 - Reject unknown `contractVersion`: respond 409 with
   `{error:"contract-version-mismatch", contractVersion:"<the version THIS side speaks>"}` so
   a half-deployed pair fails loudly rather than silently misbehaving. Both directions use this

@@ -9,10 +9,13 @@ export function freshDb(): Database {
   return openDb(":memory:");
 }
 
+export const TEST_MINI_AUTH_SECRET = "test-mini-secret";
+
 export function testConfig(overrides: Partial<Config> = {}): Config {
   return resetConfig({
     vercelCallbackUrl: "https://vercel.test/api/mini/callback",
     callbackSecret: "test-secret",
+    miniAuthSecret: TEST_MINI_AUTH_SECRET,
     maxConcurrentExecutions: 2,
     maxConcurrentPlans: 3,
     dbPath: ":memory:",
@@ -68,10 +71,24 @@ export function createJobBody(overrides: Record<string, unknown> = {}) {
   };
 }
 
+// Builds an authorized request by default (valid bearer). Pass an `Authorization` override in
+// `headers` to exercise the unauthorized paths.
 export function postJson(path: string, body: unknown, headers: Record<string, string> = {}): Request {
   return new Request(`http://mini.test${path}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", ...headers },
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${TEST_MINI_AUTH_SECRET}`,
+      ...headers,
+    },
     body: JSON.stringify(body),
+  });
+}
+
+// A GET request carrying the default valid bearer (for /healthz).
+export function getAuthed(path: string, headers: Record<string, string> = {}): Request {
+  return new Request(`http://mini.test${path}`, {
+    method: "GET",
+    headers: { Authorization: `Bearer ${TEST_MINI_AUTH_SECRET}`, ...headers },
   });
 }

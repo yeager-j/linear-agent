@@ -67,11 +67,20 @@ describe("POST /api/mini/callback", () => {
     expect(resumeHook).toHaveBeenCalledWith("job:job_1", expect.objectContaining({ jobId: "job_1" }));
   });
 
-  it("is idempotent: a duplicate (already-consumed token) acks as a no-op", async () => {
+  it("returns a retryable 503 when the hook is not registered yet (or already consumed)", async () => {
+    // HookNotFound conflates an early callback (hook not created yet) with a duplicate. We ask the
+    // mini to retry rather than 200-acking — a 200 would silently drop a fast job's first callback
+    // and wedge the workflow until its 45-min timeout.
     resumeHook.mockRejectedValue(new FakeHookNotFoundError("gone"));
     const res = await POST(makeRequest(validBody, { auth: `Bearer ${CALLBACK_SECRET}` }));
-    expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ ack: true });
+    expect(res.status).toBe(503);
+    expect(await res.json()).toMatchObject({ error: "no-active-job-hook" });
+  });
+
+  it("returns 500 when resume fails for a non-HookNotFound reason", async () => {
+    resumeHook.mockRejectedValue(new Error("workflow store unavailable"));
+    const res = await POST(makeRequest(validBody, { auth: `Bearer ${CALLBACK_SECRET}` }));
+    expect(res.status).toBe(500);
   });
 
   it("rejects a malformed body with 400", async () => {

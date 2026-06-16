@@ -1,7 +1,8 @@
 // GET /api/health — liveness probe that an external monitor (e.g. healthchecks.io) can ping.
 // Proxies the mini's GET /healthz over the tunnel (plan §7). Returns 200 only when the mini is
-// reachable and reports ok; 503 otherwise. No auth: it leaks only aggregate health, and the mini
-// call itself is gated by the CF-Access service token.
+// reachable and reports ok; 503 otherwise. This Vercel route is unauthenticated and exposes only
+// aggregate mini health. The mini call it makes is authenticated — the mini requires the bearer
+// secret (and, behind the tunnel, the CF-Access service token) on /healthz like every endpoint.
 
 import { healthz } from "@/lib/mini";
 

@@ -54,7 +54,7 @@ export const realQuery: QueryFn = (params) => {
       },
     });
     for await (const msg of iter) {
-      yield msg as unknown as SDKLikeMessage;
+      yield msg as SDKLikeMessage;
     }
   }
   return run();

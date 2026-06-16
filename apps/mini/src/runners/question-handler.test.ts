@@ -92,7 +92,7 @@ describe("makeCanUseTool", () => {
     });
     const res = await handler(ASK(), askInput);
     expect(res.behavior).toBe("deny");
-    expect(pendingCount()).toBe(0); // pending question cleaned up implicitly (never resolved; left registered)
+    expect(pendingCount()).toBe(0); // the catch path calls resolveQuestion to drop the orphaned entry
   });
 
   test("unparseable AskUserQuestion input denies", async () => {

@@ -6,9 +6,12 @@
 // changes, push the branch, open a PR. The terminal callback carries {prUrl, branch}; the
 // Vercel workflow sets externalUrls + emits the final response.
 //
-// Container execution (OrbStack) is gated behind USE_CONTAINER; the real `docker run` invocation
-// is written but off by default (no OrbStack in this environment). The local path is the
-// fallback and is what the tests exercise (with an injected query stream that "makes changes").
+// SECURITY (not yet hardened): the SDK currently runs IN-PROCESS on the host, in the session's
+// worktree, with permissionMode "dontAsk" + a Bash/Write/WebFetch allowlist — so a prompt-injected
+// issue can run arbitrary commands as this user. The design (plan §53/§213) calls for an OrbStack
+// container with an egress allowlist; that is NOT wired yet. USE_CONTAINER is currently a no-op
+// that logs a warning and still runs locally (see below). Only run this on a trusted machine until
+// the container path lands. The local path is what the tests exercise (injected query stream).
 
 import { $ } from "bun";
 import type { RunnerContext, RunnerResult } from "../jobctl.ts";

@@ -163,12 +163,16 @@ export function getJobByIdempotencyKey(d: Database, key: string): JobRow | null 
 }
 
 export function updateJob(d: Database, jobId: string, patch: Partial<Omit<JobRow, "job_id">>): void {
-  const keys = Object.keys(patch);
-  if (keys.length === 0) return;
-  const sets = keys.map((k) => `${k} = $${k}`).join(", ");
-  const params: Record<string, unknown> = { id: jobId, updated_at: now() };
-  for (const k of keys) params[k] = (patch as Record<string, unknown>)[k];
-  d.query(`UPDATE jobs SET ${sets}, updated_at = $updated_at WHERE job_id = $id`).run(params as never);
+  // JobRow fields are string | number | null; Partial adds undefined, which we drop (a
+  // type-guard filter, so the remaining values are valid SQLite bindings without any cast).
+  const entries = Object.entries(patch).filter(
+    (e): e is [string, string | number | null] => e[1] !== undefined,
+  );
+  if (entries.length === 0) return;
+  const sets = entries.map(([k]) => `${k} = $${k}`).join(", ");
+  const params: Record<string, string | number | null> = { id: jobId, updated_at: now() };
+  for (const [k, v] of entries) params[k] = v;
+  d.query(`UPDATE jobs SET ${sets}, updated_at = $updated_at WHERE job_id = $id`).run(params);
 }
 
 // Jobs still marked running at boot — the process died mid-job. Reconciliation marks these

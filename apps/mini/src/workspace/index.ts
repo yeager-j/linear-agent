@@ -10,7 +10,7 @@
 // jobs don't race `git fetch` on the same object store.
 
 import { $ } from "bun";
-import { mkdir, rm, readdir } from "node:fs/promises";
+import { mkdir, rm } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { config } from "../config.ts";
@@ -67,15 +67,27 @@ export function repoSlug(repoUrl: string): string {
   return (tail || "repo").replace(/[^a-zA-Z0-9_.-]/g, "-");
 }
 
-// Sanitize a Linear session id for use as a directory name.
+// Sanitize a Linear session id for use as a directory name. Replacing `/` already blocks nested
+// traversal, but `.` and `..` survive the char filter and would resolve the worktree to the
+// worktrees root (or its parent), which then reaches a recursive rm — so reject them outright.
 function sessionDir(linearSessionId: string): string {
-  return linearSessionId.replace(/[^a-zA-Z0-9_.-]/g, "-");
+  const safe = linearSessionId.replace(/[^a-zA-Z0-9_.-]/g, "-");
+  if (safe === "" || safe === "." || safe === "..") {
+    throw new Error(`unsafe linearSessionId for a directory name: ${JSON.stringify(linearSessionId)}`);
+  }
+  return safe;
 }
 
 function paths(repoUrl: string, linearSessionId: string) {
   const root = config().workRoot;
   const barePath = join(root, "repos", `${repoSlug(repoUrl)}.git`);
-  const worktreePath = join(root, "worktrees", sessionDir(linearSessionId));
+  const worktreesRoot = join(root, "worktrees");
+  const worktreePath = join(worktreesRoot, sessionDir(linearSessionId));
+  // Belt-and-suspenders: the worktree must stay strictly inside the worktrees root before any
+  // mkdir/rm touches it. sessionDir already rejects `.`/`..`/empty; this catches any future regression.
+  if (!`${worktreePath}/`.startsWith(`${worktreesRoot}/`)) {
+    throw new Error(`worktree path escapes the worktrees root: ${worktreePath}`);
+  }
   return { root, barePath, worktreePath };
 }
 
@@ -85,7 +97,10 @@ async function ensureBareClone(repoUrl: string, barePath: string, baseBranch: st
   await withFetchLock(barePath, async () => {
     if (!existsSync(barePath)) {
       log.info("bare clone", { repoUrl, barePath });
-      await $`git clone --bare ${repoUrl} ${barePath}`.quiet();
+      // `--` ends option parsing: even though Bun's $ escapes shell metacharacters, git itself
+      // would still treat a leading-dash repoUrl as an option (e.g. --upload-pack=…). Harmless
+      // today (repoUrl is env-sourced) but free insurance if repo selection becomes per-issue.
+      await $`git clone --bare -- ${repoUrl} ${barePath}`.quiet();
     } else {
       log.debug("bare fetch", { barePath, baseBranch });
       // Update ONLY the base branch into its plain ref (refs/heads/<base>). Do NOT mirror all
@@ -218,6 +233,3 @@ export async function listWorktreeDirs(database?: Database): Promise<string[]> {
 export function computePaths(repoUrl: string, linearSessionId: string) {
   return paths(repoUrl, linearSessionId);
 }
-
-// Re-export so callers don't reach into node:fs.
-export { readdir };

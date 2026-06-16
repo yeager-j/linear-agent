@@ -7,9 +7,11 @@
     "start": "bun index.ts",
     "dev": "bun --hot index.ts",
     "test": "bun test",
+    "mutation": "stryker run",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
+    "@stryker-mutator/core": "^9.6.1",
     "@types/bun": "latest"
   },
   "peerDependencies": {

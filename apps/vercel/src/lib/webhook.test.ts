@@ -47,6 +47,15 @@ describe("parseWebhook — created", () => {
     expect(parsed).toMatchObject({ issueIdentifier: "sess_x" });
   });
 
+  it("treats an empty-string field as absent (str rejects empty, not just null)", () => {
+    const parsed = parseWebhook({
+      action: "created",
+      agentSession: { id: "sess_e", issue: { identifier: "" } },
+    });
+    // "" must be treated as missing → fall back to the session id, not surface "".
+    expect(parsed).toMatchObject({ issueIdentifier: "sess_e" });
+  });
+
   it("prefers a top-level envelope promptContext over agentSession.promptContext", () => {
     const parsed = parseWebhook({
       action: "created",

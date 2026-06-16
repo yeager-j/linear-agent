@@ -4,7 +4,8 @@
 // route handler — never from the workflow body directly.
 
 import crypto from "node:crypto";
-import { env, LINEAR_GRAPHQL_URL, WEBHOOK_MAX_AGE_MS } from "./env";
+import { env, LINEAR_GRAPHQL_URL } from "./env";
+import { WEBHOOK_MAX_AGE_MS } from "./limits";
 
 /* ───────────────────────── Signature verification ───────────────────────── */
 

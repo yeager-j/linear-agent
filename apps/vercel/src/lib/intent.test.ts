@@ -12,7 +12,8 @@ describe("classifyIntent", () => {
   });
 
   it("classifies clear free-text approvals", () => {
-    for (const text of ["approve", "LGTM", "looks good", "yes", "ship it", "go ahead", "👍"]) {
+    // "go for it" exercises the SECOND approve pattern, which the other phrases don't reach.
+    for (const text of ["approve", "LGTM", "looks good", "yes", "ship it", "go ahead", "go for it", "👍"]) {
       expect(classifyIntent({ text })).toBe("approve");
     }
   });

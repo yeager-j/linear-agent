@@ -10,6 +10,7 @@
 // mini HTTP calls; the control flow, hooks, elicitation loop, and finalize are already real.
 
 import { defineHook, sleep } from "workflow";
+import { z } from "zod";
 import {
   JobDoneHookPayload,
   PromptHookPayload,
@@ -43,7 +44,7 @@ import {
   MAX_REVISION_ROUNDS,
   SWEEP_NUDGE_AFTER,
   SWEEP_REAP_AFTER,
-} from "@/lib/env";
+} from "@/lib/limits";
 
 /* ───────────────────────── Hooks (exported so routes can resume) ───────────────────────── */
 
@@ -56,6 +57,14 @@ export const jobDoneHook = defineHook({ schema: JobDoneHookPayload });
 // questionHook — resumed by /api/mini/question when the agent asks a mid-run AskUserQuestion
 // (token: question:<jobId>). Carries one or more questions answered together.
 export const questionHook = defineHook({ schema: QuestionHookPayload });
+
+// sessionLockHook — per-session ownership lock. Two `created` deliveries for the same session
+// (re-delivery with a new id, or re-delegation) would otherwise each start() a run; both then
+// create prompt:<sid> hooks and the loser crashes with HookConflictError. The run claims this
+// deterministic lock token at the top and, if another active run already owns it, exits cleanly.
+// It is NEVER resumed — it exists only for getConflict()'s deterministic-token dedupe.
+export const sessionLockHook = defineHook({ schema: z.unknown() });
+const sessionLockToken = (linearSessionId: string) => `lock:${linearSessionId}`;
 
 /* ───────────────────────── Workflow input ───────────────────────── */
 
@@ -110,7 +119,9 @@ async function syncStatusStep(issueId: string | undefined): Promise<void> {
   }
 }
 
-async function ackThought(linearSessionId: string, body: string): Promise<void> {
+// Emit a plain (durable) thought to Linear. A step so it fires exactly once and is NOT re-run on
+// every workflow replay (an un-stepped emitThought in the body would duplicate the activity).
+async function emitThoughtStep(linearSessionId: string, body: string): Promise<void> {
   "use step";
   await emitThought(linearSessionId, body);
 }
@@ -127,14 +138,6 @@ async function sendElicitation(linearSessionId: string, planSummary?: string): P
     { label: "Approve", value: "approve" },
     { label: "Request changes", value: "request_changes" },
   ]);
-}
-
-async function nudge(linearSessionId: string): Promise<void> {
-  "use step";
-  await emitThought(
-    linearSessionId,
-    "Still here whenever you're ready — approve the plan or tell me what to change.",
-  );
 }
 
 // Tell the mini to reap the worktree but keep the Claude session id (plan §7 sweeper).
@@ -217,7 +220,7 @@ async function finalizeStop(linearSessionId: string): Promise<void> {
 
 // Result of waiting on a running job. `question` is handled INSIDE the loop below and never
 // surfaces to callers; callers see only done / stop / timeout.
-type WaitJobResult =
+export type WaitJobResult =
   | { kind: "done"; value: JobDoneHookPayloadT }
   | { kind: "stop" }
   | { kind: "timeout" };
@@ -230,6 +233,7 @@ type RaceOutcome =
   | { kind: "done"; value: JobDoneHookPayloadT }
   | { kind: "question"; jobId: string; questionId: string; questions: AgentQuestion[] }
   | { kind: "stop" }
+  | { kind: "dropped" } // a non-stop reply arrived mid-run; surfaced to the user, then ignored
   | { kind: "timeout" };
 
 // Wait for a running job to finish, handling any mid-run AskUserQuestion(s) along the way.
@@ -246,7 +250,7 @@ type RaceOutcome =
 async function waitForJob(
   jobId: string,
   linearSessionId: string,
-  opts: { withStop: boolean; issueId?: string },
+  opts: { withStop: boolean },
 ): Promise<WaitJobResult> {
   using done = jobDoneHook.create({ token: jobDoneToken(jobId) });
   using question = questionHook.create({ token: questionToken(jobId) });
@@ -263,17 +267,16 @@ async function waitForJob(
   // are reused on the next round. The timeout is a single budget for the whole wait.
   const doneBranch: Promise<RaceOutcome> = (async () => ({ kind: "done", value: await done }))();
   const timeoutBranch: Promise<RaceOutcome> = sleep(JOB_TIMEOUT).then(() => ({ kind: "timeout" }));
-  const stopBranch: Promise<RaceOutcome> = opts.withStop
-    ? (async (): Promise<RaceOutcome> => {
-        // Only a stop signal short-circuits; drain non-stop messages so a stale non-stop value
-        // can't permanently win the race.
-        while (true) {
-          const { value, done: end } = await stopIter.next();
-          if (end || !value) return { kind: "timeout" };
-          if (value.signal === "stop") return { kind: "stop" };
-        }
-      })()
-    : new Promise<RaceOutcome>(() => {}); // never resolves when stop isn't wanted
+
+  // Resolve on the NEXT promptHook event: a stop short-circuits the wait; any other (non-stop)
+  // reply surfaces as "dropped" so the loop can acknowledge it to the user and re-arm — a stale
+  // non-stop value can't permanently win the race, and it's no longer silently discarded.
+  const nextStop = (): Promise<RaceOutcome> =>
+    (async (): Promise<RaceOutcome> => {
+      const { value, done: end } = await stopIter.next();
+      if (end || !value) return { kind: "timeout" };
+      return value.signal === "stop" ? { kind: "stop" } : { kind: "dropped" };
+    })();
 
   const nextQuestion = (): Promise<RaceOutcome> =>
     (async (): Promise<RaceOutcome> => {
@@ -287,6 +290,9 @@ async function waitForJob(
       };
     })();
 
+  let stopBranch: Promise<RaceOutcome> = opts.withStop
+    ? nextStop()
+    : new Promise<RaceOutcome>(() => {}); // never resolves when stop isn't wanted
   let questionBranch = nextQuestion();
   let questionRounds = 0;
   while (true) {
@@ -298,19 +304,32 @@ async function waitForJob(
     if (outcome.kind === "stop") return { kind: "stop" };
     if (outcome.kind === "timeout") return { kind: "timeout" };
 
+    if (outcome.kind === "dropped") {
+      // A reply landed mid-run. We can't act on it until the current step finishes; tell the user
+      // so their message isn't silently lost, then re-arm the stop branch and keep waiting.
+      console.warn(`[session] reply arrived during a running job; acknowledged and ignored`);
+      await emitThoughtStep(
+        linearSessionId,
+        "I'm still working on the current step — I saw your message but can't act on it yet. " +
+          "Please re-send it once I post the next update.",
+      );
+      stopBranch = nextStop();
+      continue;
+    }
+
     // outcome.kind === "question" — handle it WITHOUT disposing the question hook, so a second
     // question that arrives during handling is buffered by the still-registered hook and picked
     // up by the next questionIter.next() below.
     questionRounds += 1;
     if (questionRounds > MAX_QUESTION_ROUNDS) {
-      await emitThought(
+      await emitThoughtStep(
         linearSessionId,
         "Too many clarifying questions in a row — stopping to avoid a loop.",
       );
       return { kind: "timeout" };
     }
 
-    const asked = await askQuestionsViaLinear(linearSessionId, outcome.questions, opts.issueId);
+    const asked = await askQuestionsViaLinear(linearSessionId, outcome.questions);
     if (asked.kind === "stop") return { kind: "stop" };
     await deliverAnswerStep(outcome.jobId, outcome.questionId, asked.answers);
 
@@ -331,12 +350,11 @@ type AskResult = { kind: "answers"; answers: Record<string, string> } | { kind: 
 async function askQuestionsViaLinear(
   linearSessionId: string,
   questions: AgentQuestion[],
-  issueId?: string,
 ): Promise<AskResult> {
   const answers: Record<string, string> = {};
   for (const q of questions) {
     await emitQuestionStep(linearSessionId, q);
-    const reply = await waitForPromptWithSweeper(linearSessionId, issueId);
+    const reply = await waitForPromptWithSweeper(linearSessionId);
     if (reply.kind === "stop") return { kind: "stop" };
     // Normalized per the contract: single-select → option label; multiSelect → matched labels
     // joined by ", " (fallback to raw text). Keyed by the question text.
@@ -351,7 +369,7 @@ type PromptResult =
 
 // Approval wait with the built-in sweeper (plan §7): race promptHook against sleep(3d) -> nudge ->
 // sleep(4d) -> reap worktree, then KEEP waiting on the same hook so a late reply still resumes.
-async function waitForPromptWithSweeper(linearSessionId: string, issueId?: string): Promise<PromptResult> {
+async function waitForPromptWithSweeper(linearSessionId: string): Promise<PromptResult> {
   using prompt = promptHook.create({ token: promptToken(linearSessionId) });
   const next = (async (): Promise<{ text: string; signal?: "stop"; selectValue?: string }> => await prompt)();
 
@@ -361,7 +379,10 @@ async function waitForPromptWithSweeper(linearSessionId: string, issueId?: strin
     sleep(SWEEP_NUDGE_AFTER).then(() => ({ kind: "nudge" as const })),
   ]);
   if (stage1.kind === "msg") return toPromptResult(stage1.value);
-  await nudge(linearSessionId);
+  await emitThoughtStep(
+    linearSessionId,
+    "Still here whenever you're ready — approve the plan or tell me what to change.",
+  );
 
   // Stage 2: wait up to 4 more days, else reap the worktree.
   const stage2 = await Promise.race([
@@ -370,15 +391,63 @@ async function waitForPromptWithSweeper(linearSessionId: string, issueId?: strin
   ]);
   if (stage2.kind === "msg") return toPromptResult(stage2.value);
   await reapWorktree(linearSessionId);
-  void issueId; // reserved for richer reap behavior
 
   // Stage 3: keep waiting indefinitely; a late reply re-creates the worktree and resumes.
   return toPromptResult(await next);
 }
 
-function toPromptResult(value: { text: string; signal?: "stop"; selectValue?: string }): PromptResult {
+export function toPromptResult(value: { text: string; signal?: "stop"; selectValue?: string }): PromptResult {
   if (value.signal === "stop") return { kind: "stop" };
   return { kind: "prompt", value: { text: value.text, selectValue: value.selectValue } };
+}
+
+/* ───────────────────────── Job-outcome handling (shared across plan / revise / execute) ─────────────────────────
+ * Plan, revise, and execute each react to a waitForJob result identically: a stop aborts + finalizes,
+ * a timeout / non-succeeded status surfaces a Linear error, and success continues. decideJobOutcome
+ * is the PURE decision (unit-testable); settleJobOutcome performs the IO the decision implies.
+ */
+
+export type JobDecision =
+  | { action: "stop" }
+  | { action: "error"; message: string }
+  | { action: "continue"; done: JobDoneHookPayloadT };
+
+// PURE: map a wait result + phase to the next action, with no IO. `timeoutMessage` is passed
+// explicitly because the execute phase's wording genuinely differs from plan/revise.
+export function decideJobOutcome(
+  result: WaitJobResult,
+  opts: { phase: string; timeoutMessage: string },
+): JobDecision {
+  if (result.kind === "stop") return { action: "stop" };
+  if (result.kind === "timeout") return { action: "error", message: opts.timeoutMessage };
+  if (result.value.status !== "succeeded") {
+    const reason = result.value.reason ? `: ${result.value.reason}` : ".";
+    return { action: "error", message: `${opts.phase} ${result.value.status}${reason}` };
+  }
+  return { action: "continue", done: result.value };
+}
+
+type Settled = { kind: "continue"; done: JobDoneHookPayloadT } | { kind: "returned" };
+
+// Apply decideJobOutcome's verdict: on stop, abort the mini job, allow a brief grace for the
+// abort callback, and finalize; on error, emit the Linear error; on success, hand the payload back.
+// `{kind:"returned"}` means the workflow body should `return`.
+async function settleJobOutcome(
+  result: WaitJobResult,
+  opts: { jobId: string; linearSessionId: string; phase: string; timeoutMessage: string },
+): Promise<Settled> {
+  const decision = decideJobOutcome(result, { phase: opts.phase, timeoutMessage: opts.timeoutMessage });
+  if (decision.action === "stop") {
+    await abortMiniJob(opts.jobId);
+    await sleep(ABORT_GRACE); // brief grace for the abort callback (best-effort)
+    await finalizeStop(opts.linearSessionId);
+    return { kind: "returned" };
+  }
+  if (decision.action === "error") {
+    await finalizeError(opts.linearSessionId, decision.message);
+    return { kind: "returned" };
+  }
+  return { kind: "continue", done: decision.done };
 }
 
 /* ───────────────────────── The workflow ───────────────────────── */
@@ -386,41 +455,33 @@ function toPromptResult(value: { text: string; signal?: "stop"; selectValue?: st
 export async function sessionWorkflow(input: SessionInput): Promise<void> {
   "use workflow";
 
-  await ackThought(input.linearSessionId, `Looking into ${input.issueIdentifier}…`);
+  // Ownership lock: if another run already claimed this session (a duplicate `created`), this run
+  // is the loser of the race — exit cleanly before doing any work or creating conflicting hooks.
+  using lock = sessionLockHook.create({ token: sessionLockToken(input.linearSessionId) });
+  if (await lock.getConflict()) return;
+
+  await emitThoughtStep(input.linearSessionId, `Looking into ${input.issueIdentifier}…`);
   await syncStatusStep(input.issueId);
 
   let claudeSessionId: string | undefined;
 
   // PLAN
   let job = await startMiniJob({ kind: "plan", round: 0, input });
-  let done = await waitForJob(job.jobId, input.linearSessionId, {
-    withStop: true,
-    issueId: input.issueId,
+  let settled = await settleJobOutcome(await waitForJob(job.jobId, input.linearSessionId, { withStop: true }), {
+    jobId: job.jobId,
+    linearSessionId: input.linearSessionId,
+    phase: "Planning",
+    timeoutMessage: "The planning job timed out. Please try again.",
   });
-  if (done.kind === "stop") {
-    await abortMiniJob(job.jobId);
-    await sleep(ABORT_GRACE);
-    await finalizeStop(input.linearSessionId);
-    return;
-  }
-  if (done.kind === "timeout") {
-    await finalizeError(input.linearSessionId, "The planning job timed out. Please try again.");
-    return;
-  }
-  if (done.value.status !== "succeeded") {
-    await finalizeError(
-      input.linearSessionId,
-      `Planning ${done.value.status}${done.value.reason ? `: ${done.value.reason}` : "."}`,
-    );
-    return;
-  }
-  claudeSessionId = done.value.claudeSessionId ?? claudeSessionId;
+  if (settled.kind === "returned") return;
+  let done = settled.done;
+  claudeSessionId = done.claudeSessionId ?? claudeSessionId;
 
   // APPROVAL LOOP
   let round = 0;
   while (true) {
-    await sendElicitation(input.linearSessionId, done.value.planSummary);
-    const msg = await waitForPromptWithSweeper(input.linearSessionId, input.issueId);
+    await sendElicitation(input.linearSessionId, done.planSummary);
+    const msg = await waitForPromptWithSweeper(input.linearSessionId);
     if (msg.kind === "stop") {
       await finalizeStop(input.linearSessionId);
       return;
@@ -438,59 +499,29 @@ export async function sessionWorkflow(input: SessionInput): Promise<void> {
       return;
     }
 
-    job = await startMiniJob({
-      kind: "revise",
-      round,
-      input,
-      feedback: msg.value.text,
-      claudeSessionId,
+    job = await startMiniJob({ kind: "revise", round, input, feedback: msg.value.text, claudeSessionId });
+    settled = await settleJobOutcome(await waitForJob(job.jobId, input.linearSessionId, { withStop: true }), {
+      jobId: job.jobId,
+      linearSessionId: input.linearSessionId,
+      phase: "Revision",
+      timeoutMessage: "The revision job timed out. Please try again.",
     });
-    done = await waitForJob(job.jobId, input.linearSessionId, {
-      withStop: true,
-      issueId: input.issueId,
-    });
-    if (done.kind === "stop") {
-      await abortMiniJob(job.jobId);
-      await sleep(ABORT_GRACE);
-      await finalizeStop(input.linearSessionId);
-      return;
-    }
-    if (done.kind === "timeout") {
-      await finalizeError(input.linearSessionId, "The revision job timed out. Please try again.");
-      return;
-    }
-    if (done.value.status !== "succeeded") {
-      await finalizeError(
-        input.linearSessionId,
-        `Revision ${done.value.status}${done.value.reason ? `: ${done.value.reason}` : "."}`,
-      );
-      return;
-    }
-    claudeSessionId = done.value.claudeSessionId ?? claudeSessionId;
+    if (settled.kind === "returned") return;
+    done = settled.done;
+    claudeSessionId = done.claudeSessionId ?? claudeSessionId;
   }
 
   // EXECUTE
   const execJob = await startMiniJob({ kind: "execute", round: 0, input, claudeSessionId });
-  const result = await waitForJob(execJob.jobId, input.linearSessionId, {
-    withStop: true,
-    issueId: input.issueId,
-  });
-  if (result.kind === "stop") {
-    await abortMiniJob(execJob.jobId);
-    await sleep(ABORT_GRACE); // brief grace for the abort callback (best-effort)
-    await finalizeStop(input.linearSessionId);
-    return;
-  }
-  if (result.kind === "timeout") {
-    await finalizeError(input.linearSessionId, "The execution job timed out. Check the mini's logs.");
-    return;
-  }
-  if (result.value.status !== "succeeded") {
-    await finalizeError(
-      input.linearSessionId,
-      `Execution ${result.value.status}${result.value.reason ? `: ${result.value.reason}` : "."}`,
-    );
-    return;
-  }
-  await finalizeSuccess(input.linearSessionId, result.value);
+  const execSettled = await settleJobOutcome(
+    await waitForJob(execJob.jobId, input.linearSessionId, { withStop: true }),
+    {
+      jobId: execJob.jobId,
+      linearSessionId: input.linearSessionId,
+      phase: "Execution",
+      timeoutMessage: "The execution job timed out. Check the mini's logs.",
+    },
+  );
+  if (execSettled.kind === "returned") return;
+  await finalizeSuccess(input.linearSessionId, execSettled.done);
 }

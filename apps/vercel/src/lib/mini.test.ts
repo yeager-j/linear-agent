@@ -7,6 +7,7 @@ beforeAll(async () => {
   process.env.MINI_BASE_URL = "https://mini.example.com";
   process.env.CF_ACCESS_CLIENT_ID = "cf-id";
   process.env.CF_ACCESS_CLIENT_SECRET = "cf-secret";
+  process.env.MINI_AUTH_SECRET = "mini-bearer";
   mini = await import("./mini");
 });
 
@@ -39,6 +40,7 @@ describe("createJob", () => {
     const [url, init] = fetchMock.mock.calls[0];
     expect(url).toBe("https://mini.example.com/jobs");
     const headers = init!.headers as Record<string, string>;
+    expect(headers["Authorization"]).toBe("Bearer mini-bearer");
     expect(headers["CF-Access-Client-Id"]).toBe("cf-id");
     expect(headers["CF-Access-Client-Secret"]).toBe("cf-secret");
     const sent = JSON.parse(init!.body as string);

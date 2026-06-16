@@ -26,10 +26,24 @@ export function registerQuestion(questionId: string, jobId: string): Promise<Rec
 }
 
 // Deliver answers for a pending question. Returns true if a pending question matched (and was
-// resolved + removed); false if unknown/stale (no-op).
-export function resolveQuestion(questionId: string, answers: Record<string, string>): boolean {
+// resolved + removed); false if unknown/stale (no-op). When `expectedJobId` is provided, the
+// pending question must belong to that job — a wrong-job answer is a no-op (returns false), so an
+// answer routed to the wrong job can never resolve another job's question.
+export function resolveQuestion(
+  questionId: string,
+  answers: Record<string, string>,
+  expectedJobId?: string,
+): boolean {
   const p = pending.get(questionId);
   if (!p) return false;
+  if (expectedJobId !== undefined && p.jobId !== expectedJobId) {
+    log.warn("answer jobId does not match the pending question's job; ignoring", {
+      questionId,
+      expectedJobId,
+      pendingJobId: p.jobId,
+    });
+    return false;
+  }
   pending.delete(questionId);
   p.resolve(answers);
   log.info("question resolved", { questionId, jobId: p.jobId });
