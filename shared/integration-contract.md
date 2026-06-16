@@ -26,7 +26,11 @@ Mini    ──(CALLBACK_SECRET bearer)──────────►  Vercel 
 
 ---
 
-## 1. Shared zod schemas — copy verbatim into BOTH projects
+## 1. Shared zod schemas — implemented in `packages/contract`
+
+> These schemas now live ONCE in `packages/contract/src/index.ts` (the `@linear-agent/contract`
+> workspace package); both apps import them, so there is nothing to copy by hand. The block below
+> is the human-readable spec — keep it and the package consistent.
 
 ```ts
 import { z } from "zod";
