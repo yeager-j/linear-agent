@@ -92,6 +92,39 @@ describe("prepareWorkspace", () => {
     expect(existsSync(join(b.worktreePath, "scratch.txt"))).toBe(true);
   });
 
+  test("a second prepare (execute after plan) keeps the session branch rooted on main", async () => {
+    // Regression: a mirror+prune fetch on the second prepare would DELETE the session's branch
+    // (it doesn't exist on origin), unbornning the worktree HEAD so the next commit is a root
+    // commit -> orphan branch -> GitHub PR 422 "no history in common with main".
+    const ws = await prepareWorkspace({
+      linearSessionId: "s1",
+      issueIdentifier: "ENG-1",
+      repoUrl: originUrl,
+      database: d,
+    });
+    const mainSha = (await $`git -C ${ws.worktreePath} rev-parse main`.text()).trim();
+
+    // Second prepare = the "execute" job: re-runs ensureBareClone's fetch, then reuses the tree.
+    const ws2 = await prepareWorkspace({
+      linearSessionId: "s1",
+      issueIdentifier: "ENG-1",
+      repoUrl: originUrl,
+      database: d,
+    });
+    expect(ws2.worktreePath).toBe(ws.worktreePath);
+
+    // The branch must still resolve to main's commit (not pruned/unborn).
+    const head = (await $`git -C ${ws2.worktreePath} rev-parse HEAD`.text()).trim();
+    expect(head).toBe(mainSha);
+
+    // A commit now must have main as its PARENT (not a root commit) -> shares history with main.
+    await Bun.write(join(ws2.worktreePath, "change.txt"), "x");
+    await $`git -C ${ws2.worktreePath} add -A`.quiet();
+    await $`git -C ${ws2.worktreePath} -c user.email=a@a.test -c user.name=a commit -q -m change`.quiet();
+    const parent = (await $`git -C ${ws2.worktreePath} rev-parse HEAD^`.text()).trim();
+    expect(parent).toBe(mainSha);
+  });
+
   test("concurrent prepares for two sessions share one bare clone (mutex serializes)", async () => {
     const [w1, w2] = await Promise.all([
       prepareWorkspace({ linearSessionId: "s1", issueIdentifier: "ENG-1", repoUrl: originUrl, database: d }),

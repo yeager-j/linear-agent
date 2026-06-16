@@ -79,18 +79,21 @@ function paths(repoUrl: string, linearSessionId: string) {
   return { root, barePath, worktreePath };
 }
 
-// Ensure a bare clone exists and is up to date. Serialized per bare path.
-async function ensureBareClone(repoUrl: string, barePath: string): Promise<void> {
+// Ensure a bare clone exists and the base branch is up to date. Serialized per bare path.
+async function ensureBareClone(repoUrl: string, barePath: string, baseBranch: string): Promise<void> {
   await mkdir(join(barePath, ".."), { recursive: true });
   await withFetchLock(barePath, async () => {
     if (!existsSync(barePath)) {
       log.info("bare clone", { repoUrl, barePath });
       await $`git clone --bare ${repoUrl} ${barePath}`.quiet();
     } else {
-      log.debug("bare fetch", { barePath });
-      // A bare clone keeps upstream heads under refs/heads/* (no origin/* remote-tracking).
-      // Mirror that on fetch so the base ref stays a plain branch name.
-      await $`git --git-dir=${barePath} fetch --prune origin "+refs/heads/*:refs/heads/*"`.quiet();
+      log.debug("bare fetch", { barePath, baseBranch });
+      // Update ONLY the base branch into its plain ref (refs/heads/<base>). Do NOT mirror all
+      // heads with --prune: the bare repo also holds our per-session worktree branches
+      // (agent/<issue>-<session>), which don't exist on origin — a mirror+prune fetch would
+      // DELETE them, leaving the worktree's HEAD unborn so the next commit becomes a root commit
+      // (orphan branch -> GitHub PR 422 "no history in common"). Only origin's base branch here.
+      await $`git --git-dir=${barePath} fetch origin ${`+refs/heads/${baseBranch}:refs/heads/${baseBranch}`}`.quiet();
     }
   });
 }
@@ -102,7 +105,7 @@ export async function prepareWorkspace(opts: PrepareOptions): Promise<Workspace>
   const { barePath, worktreePath } = paths(opts.repoUrl, opts.linearSessionId);
   const branch = branchName(opts.issueIdentifier, opts.linearSessionId);
 
-  await ensureBareClone(opts.repoUrl, barePath);
+  await ensureBareClone(opts.repoUrl, barePath, baseBranch);
 
   // Guard: the base branch MUST resolve in the bare clone. If it doesn't (empty repo, or a
   // default branch that isn't `baseBranch`), `git worktree add -B <branch> <path> <base>` would
