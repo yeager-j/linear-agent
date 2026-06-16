@@ -30,3 +30,6 @@ npm-debug.log*
 
 # os
 .DS_Store
+
+# JetBrains IDE
+.idea/

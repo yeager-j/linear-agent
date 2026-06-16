@@ -177,7 +177,10 @@ type WaitJobResult =
 // a Linear error instead of a run paused forever.
 async function waitForJob(jobId: string): Promise<WaitJobResult> {
   using done = jobDoneHook.create({ token: jobDoneToken(jobId) });
-  return Promise.race([
+  // MUST `return await` (not `return`): a bare `return Promise.race(...)` exits this scope
+  // synchronously, so `using` disposes the hook the instant the race is built — before the
+  // callback can resume it. Awaiting keeps the hook alive until the race settles.
+  return await Promise.race([
     (async (): Promise<WaitJobResult> => ({ kind: "done", value: await done }))(),
     sleep(JOB_TIMEOUT).then((): WaitJobResult => ({ kind: "timeout" })),
   ]);
@@ -193,7 +196,9 @@ type WaitJobOrStopResult =
 async function waitForJobOrStop(jobId: string, linearSessionId: string): Promise<WaitJobOrStopResult> {
   using done = jobDoneHook.create({ token: jobDoneToken(jobId) });
   using stop = promptHook.create({ token: promptToken(linearSessionId) });
-  return Promise.race([
+  // `return await` (not bare `return`) so `using` keeps both hooks alive until the race settles
+  // — see waitForJob for why a bare return disposes them before they can be resumed.
+  return await Promise.race([
     (async (): Promise<WaitJobOrStopResult> => ({ kind: "done", value: await done }))(),
     (async (): Promise<WaitJobOrStopResult> => {
       // Only a stop signal short-circuits the execute; non-stop prompts during execute are ignored.
