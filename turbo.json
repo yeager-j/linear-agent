@@ -16,7 +16,13 @@
         "DATABASE_URL",
         "VERCEL_*"
       ],
-      "outputs": [".next/**", "!.next/cache/**", "dist/**"]
+      "outputs": [
+        ".next/**",
+        "!.next/cache/**",
+        "dist/**",
+        "app/.well-known/workflow/**",
+        "src/app/.well-known/workflow/**"
+      ]
     },
     "typecheck": {
       "dependsOn": ["^build"]
