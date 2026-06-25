@@ -3,6 +3,19 @@
   "tasks": {
     "build": {
       "dependsOn": ["^build"],
+      "passThroughEnv": [
+        "LINEAR_WEBHOOK_SECRET",
+        "LINEAR_CLIENT_ID",
+        "LINEAR_CLIENT_SECRET",
+        "LINEAR_APP_USER_ID",
+        "MINI_BASE_URL",
+        "MINI_AUTH_SECRET",
+        "CF_ACCESS_CLIENT_ID",
+        "CF_ACCESS_CLIENT_SECRET",
+        "CALLBACK_SECRET",
+        "DATABASE_URL",
+        "VERCEL_*"
+      ],
       "outputs": [".next/**", "!.next/cache/**", "dist/**"]
     },
     "typecheck": {
