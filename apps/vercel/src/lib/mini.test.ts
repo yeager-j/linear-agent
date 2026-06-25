@@ -1,6 +1,12 @@
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { CONTRACT_VERSION } from "./contract";
 
+// createJob now mints a fresh Linear token via the token authority; mock it so the test doesn't
+// touch Neon.
+vi.mock("./linear-token", () => ({
+  getValidAccessToken: vi.fn(async () => "fresh-linear-token"),
+}));
+
 let mini: typeof import("./mini");
 
 beforeAll(async () => {
@@ -46,6 +52,7 @@ describe("createJob", () => {
     const sent = JSON.parse(init!.body as string);
     expect(sent.contractVersion).toBe(CONTRACT_VERSION);
     expect(sent.idempotencyKey).toBe("sess_1:plan:0");
+    expect(sent.linearAccessToken).toBe("fresh-linear-token");
   });
 
   it("throws a ContractVersionMismatchError on a 409 and does not retry", async () => {

@@ -20,6 +20,7 @@ import {
   type ReapWorktreeResponse as ReapWorktreeResponseT,
 } from "./contract";
 import { env } from "./env";
+import { getValidAccessToken } from "./linear-token";
 
 class ContractVersionMismatchError extends Error {
   constructor(public readonly got: string | undefined) {
@@ -98,6 +99,9 @@ export async function createJob(args: {
     promptContext: args.promptContext,
     feedback: args.feedback,
     claudeSessionId: args.claudeSessionId,
+    // Fresh, auto-refreshed Linear token for the mini's activity stream — captured at job start
+    // (jobs run << the 24h token life), so the mini never needs to refresh.
+    linearAccessToken: await getValidAccessToken(),
     idempotencyKey: `${args.linearSessionId}:${args.kind}:${args.round}`,
   });
 

@@ -16,6 +16,9 @@ export function testConfig(overrides: Partial<Config> = {}): Config {
     vercelCallbackUrl: "https://vercel.test/api/mini/callback",
     callbackSecret: "test-secret",
     miniAuthSecret: TEST_MINI_AUTH_SECRET,
+    // A token so runners don't hit the missing-linear-token fail-loud guard. Pass
+    // `linearAccessToken: undefined` to exercise that guard explicitly.
+    linearAccessToken: "test-linear-token",
     maxConcurrentExecutions: 2,
     maxConcurrentPlans: 3,
     dbPath: ":memory:",

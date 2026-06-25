@@ -9,14 +9,15 @@ import type { SendQuestionFn } from "./question-handler.ts";
 
 export interface RunnerDeps {
   query: QueryFn;
-  makeLinear: () => LinearClient;
+  // token = the per-job Linear access token (job-tokens.ts); the client authenticates with it.
+  makeLinear: (token?: string) => LinearClient;
   prepareWorkspace: (opts: PrepareOptions) => Promise<Workspace>;
   sendQuestion: SendQuestionFn;
 }
 
 let _deps: RunnerDeps = {
   query: realQuery,
-  makeLinear: () => makeLinearClient(),
+  makeLinear: (token) => makeLinearClient(undefined, token),
   prepareWorkspace: realPrepareWorkspace,
   sendQuestion: realSendQuestion,
 };

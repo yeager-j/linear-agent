@@ -11,6 +11,7 @@ import { db, getJob, updateJob, type JobRow } from "./db.ts";
 import { config } from "./config.ts";
 import { sendCallback } from "./callback.ts";
 import { rejectQuestionsForJob } from "./questions.ts";
+import { deleteJobToken } from "./job-tokens.ts";
 import { log } from "./log.ts";
 import type { TerminalStatus } from "./contract.ts";
 
@@ -89,6 +90,7 @@ export class JobController {
     // Run async; never throw into the caller.
     void this.run(job, controller.signal).finally(() => {
       this.live.delete(job.job_id);
+      deleteJobToken(job.job_id); // token never outlives the job
       if (this.isExecuteKind(job.kind)) this.runningExec--;
       else this.runningPlan--;
       this.drainQueue();

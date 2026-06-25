@@ -5,6 +5,7 @@
 
 import crypto from "node:crypto";
 import { env, LINEAR_GRAPHQL_URL } from "./env";
+import { getValidAccessToken, invalidateTokenCache, LinearTokenError } from "./linear-token";
 import { WEBHOOK_MAX_AGE_MS } from "./limits";
 
 /* ───────────────────────── Signature verification ───────────────────────── */
@@ -38,14 +39,23 @@ export function isTimestampFresh(webhookTimestamp: unknown, now = Date.now()): b
 type GraphQLResult<T> = { data?: T; errors?: Array<{ message: string }> };
 
 async function gql<T>(query: string, variables: Record<string, unknown>): Promise<T> {
-  const res = await fetch(LINEAR_GRAPHQL_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: env.linearAccessToken(),
-    },
-    body: JSON.stringify({ query, variables }),
-  });
+  const doFetch = (token: string) =>
+    fetch(LINEAR_GRAPHQL_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: token },
+      body: JSON.stringify({ query, variables }),
+    });
+
+  let res = await doFetch(await getValidAccessToken());
+  if (res.status === 401) {
+    // Token rejected despite passing our freshness check (early revocation, clock skew, a missed
+    // race). Force ONE refresh and retry once; a second 401 is a real auth failure.
+    invalidateTokenCache();
+    res = await doFetch(await getValidAccessToken());
+    if (res.status === 401) {
+      throw new LinearTokenError("Linear rejected the access token even after a refresh");
+    }
+  }
   if (!res.ok) {
     const body = await res.text().catch(() => "");
     throw new Error(`Linear GraphQL HTTP ${res.status}: ${body.slice(0, 500)}`);

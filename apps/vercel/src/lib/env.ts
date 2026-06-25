@@ -16,8 +16,10 @@ function optional(name: string): string | undefined {
 }
 
 export const env = {
-  // Linear
-  linearAccessToken: () => required("LINEAR_ACCESS_TOKEN"),
+  // Linear. The access token is no longer a static env var — it lives in Neon and is auto-refreshed
+  // (lib/linear-token.ts). We only need the OAuth app credentials here to perform the refresh.
+  linearClientId: () => required("LINEAR_CLIENT_ID"),
+  linearClientSecret: () => required("LINEAR_CLIENT_SECRET"),
   linearWebhookSecret: () => required("LINEAR_WEBHOOK_SECRET"),
   // app user id is used only for self/delegate checks; optional so its absence never hard-fails
   linearAppUserId: () => optional("LINEAR_APP_USER_ID"),

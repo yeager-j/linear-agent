@@ -3,6 +3,7 @@ import { createApp } from "./server.ts";
 import { freshDb, testConfig, mockFetch, createJobBody, postJson, getAuthed } from "./test-helpers.ts";
 import type { Database } from "bun:sqlite";
 import { getJob } from "./db.ts";
+import { getJobToken, deleteJobToken } from "./job-tokens.ts";
 import type { Runner } from "./jobctl.ts";
 
 // A controllable runner: resolves when we tell it to, observes the abort signal.
@@ -52,6 +53,19 @@ describe("POST /jobs", () => {
     expect(b2.jobId).toBe(b1.jobId);
     const count = d.query("SELECT COUNT(*) AS n FROM jobs").get() as { n: number };
     expect(count.n).toBe(1);
+  });
+
+  test("stores the per-job Linear token; idempotent hit does not overwrite", async () => {
+    const app = createApp({ database: d, runner: () => new Promise(() => {}) });
+    const r1 = await app.handleCreateJob(postJson("/jobs", createJobBody({ linearAccessToken: "tok-1" })));
+    const { jobId } = (await r1.json()) as { jobId: string };
+    expect(getJobToken(jobId)).toBe("tok-1");
+    // Same idempotency key, different token => same job, original token preserved (no overwrite).
+    const r2 = await app.handleCreateJob(postJson("/jobs", createJobBody({ linearAccessToken: "tok-2" })));
+    const b2 = (await r2.json()) as { jobId: string };
+    expect(b2.jobId).toBe(jobId);
+    expect(getJobToken(jobId)).toBe("tok-1");
+    deleteJobToken(jobId);
   });
 
   test("409 on contract version mismatch (with contractVersion in body)", async () => {

@@ -42,10 +42,19 @@ interface GraphQLResult<T> {
   errors?: { message: string }[];
 }
 
-async function gql<T>(query: string, variables: Record<string, unknown>, fetchImpl: typeof fetch): Promise<T | null> {
+async function gql<T>(
+  query: string,
+  variables: Record<string, unknown>,
+  fetchImpl: typeof fetch,
+  tokenOverride?: string,
+): Promise<T | null> {
   const cfg = config();
-  if (!cfg.linearAccessToken) {
-    log.warn("LINEAR_ACCESS_TOKEN unset; skipping Linear call");
+  // Prefer the per-job token Vercel minted (config().linearAccessToken is the legacy/dev fallback,
+  // removed at cutover). When neither is set the caller has already decided to skip (dry-run) or
+  // failed the job loudly, so a missing token here is just a defensive no-op.
+  const token = tokenOverride ?? cfg.linearAccessToken;
+  if (!token) {
+    log.warn("Linear token unset (no per-job token, no env fallback); skipping Linear call");
     return null;
   }
   try {
@@ -53,7 +62,7 @@ async function gql<T>(query: string, variables: Record<string, unknown>, fetchIm
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: cfg.linearAccessToken,
+        Authorization: token,
       },
       body: JSON.stringify({ query, variables }),
     });
@@ -87,7 +96,10 @@ const AGENT_SESSION_UPDATE = /* GraphQL */ `
 
 // Real client. Every method is best-effort and never throws (the run must not fail because of
 // a Linear hiccup) — failures are logged and swallowed.
-export function makeLinearClient(fetchImpl: typeof fetch = fetch): LinearClient {
+// `tokenOverride` is the per-job Linear access token (job-tokens.ts) that Vercel minted for this
+// job; runners pass it so the client authenticates with a freshly-rotated token rather than a
+// static env credential. Omitted in dry-run / tests, where gql falls back to config or no-ops.
+export function makeLinearClient(fetchImpl: typeof fetch = fetch, tokenOverride?: string): LinearClient {
   const dryRun = config().linearDryRun;
 
   async function activity(input: Record<string, unknown>): Promise<void> {
@@ -95,7 +107,7 @@ export function makeLinearClient(fetchImpl: typeof fetch = fetch): LinearClient 
       log.info("[linear:dry-run] activity", { input });
       return;
     }
-    await gql(AGENT_ACTIVITY_CREATE, { input }, fetchImpl);
+    await gql(AGENT_ACTIVITY_CREATE, { input }, fetchImpl, tokenOverride);
   }
 
   async function sessionUpdate(sessionId: string, input: Record<string, unknown>): Promise<void> {
@@ -103,7 +115,7 @@ export function makeLinearClient(fetchImpl: typeof fetch = fetch): LinearClient 
       log.info("[linear:dry-run] sessionUpdate", { sessionId, input });
       return;
     }
-    await gql(AGENT_SESSION_UPDATE, { id: sessionId, input }, fetchImpl);
+    await gql(AGENT_SESSION_UPDATE, { id: sessionId, input }, fetchImpl, tokenOverride);
   }
 
   return {

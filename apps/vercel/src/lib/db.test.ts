@@ -1,6 +1,14 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { NeonQueryFunction } from "@neondatabase/serverless";
-import { __setSqlForTests, claimDelivery, getSession, insertSession } from "./db";
+import {
+  __setSqlForTests,
+  claimDelivery,
+  getSession,
+  insertSession,
+  claimLinearRefresh,
+  storeRefreshedToken,
+  readLinearToken,
+} from "./db";
 
 afterEach(() => {
   __setSqlForTests(null);
@@ -13,6 +21,37 @@ function fakeSql(results: unknown[][]): NeonQueryFunction<false, false> {
   const fn = (..._args: unknown[]) => Promise.resolve(results[i++] ?? []);
   return fn as unknown as NeonQueryFunction<false, false>;
 }
+
+describe("linear token store", () => {
+  it("claimLinearRefresh returns the refresh token when the claim is won", async () => {
+    __setSqlForTests(fakeSql([[{ refresh_token: "rt" }]]));
+    expect(await claimLinearRefresh("c1", 120)).toEqual({ refreshToken: "rt" });
+  });
+
+  it("claimLinearRefresh returns null when a claim is already held", async () => {
+    __setSqlForTests(fakeSql([[]]));
+    expect(await claimLinearRefresh("c1", 120)).toBeNull();
+  });
+
+  it("storeRefreshedToken returns true when the fence matches", async () => {
+    __setSqlForTests(fakeSql([[{ id: "linear" }]]));
+    expect(
+      await storeRefreshedToken("c1", { accessToken: "a", refreshToken: "r", expiresAt: new Date() }),
+    ).toBe(true);
+  });
+
+  it("storeRefreshedToken returns false when the fence does not match (claim lost)", async () => {
+    __setSqlForTests(fakeSql([[]]));
+    expect(
+      await storeRefreshedToken("c1", { accessToken: "a", refreshToken: "r", expiresAt: new Date() }),
+    ).toBe(false);
+  });
+
+  it("readLinearToken returns null when there is no row", async () => {
+    __setSqlForTests(fakeSql([[]]));
+    expect(await readLinearToken()).toBeNull();
+  });
+});
 
 describe("claimDelivery", () => {
   it("returns true when the delivery is new (row returned)", async () => {

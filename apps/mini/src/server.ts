@@ -28,6 +28,7 @@ import {
 } from "./contract.ts";
 import { getJob, getJobByIdempotencyKey, insertJob, toTerminalStatus } from "./db.ts";
 import { sendCallback } from "./callback.ts";
+import { setJobToken } from "./job-tokens.ts";
 import { JobController, type Runner } from "./jobctl.ts";
 import { makeRunner } from "./runners/index.ts";
 import { reapWorktree } from "./workspace/index.ts";
@@ -180,6 +181,10 @@ export function createApp(deps: AppDeps = {}): App {
       claude_session_id: body.claudeSessionId ?? null,
       status: "queued",
     });
+
+    // Stash the per-job Linear token in memory (NOT SQLite). New-job path only — the idempotent-hit
+    // branch above keeps the original job's token. Evicted when the job ends (jobctl `finally`).
+    if (body.linearAccessToken) setJobToken(jobId, body.linearAccessToken);
 
     const { queued } = controller.submit(jobId);
     const res: CreateJobResponse = { jobId, queued };

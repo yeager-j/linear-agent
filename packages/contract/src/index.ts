@@ -42,6 +42,12 @@ export const CreateJobRequest = z.object({
   // authoritative claudeSessionId in its SQLite; this field lets Vercel pass back what the
   // mini reported, but the mini may ignore it and use its own stored value.
   claudeSessionId: z.string().optional(),
+  // Fresh Linear access token minted by Vercel's token authority (lib/linear-token.ts), captured
+  // at job-start and used by the mini ONLY for this job's activity stream. The mini never refreshes
+  // it (jobs run << the 24h token life). Kept permissive (no .min/format) on purpose: a bad value
+  // must never surface in a zod treeifyError 400 body. Optional so a token-less call (dev/tests)
+  // still parses; the mini decides whether to fail-loud when it's absent.
+  linearAccessToken: z.string().optional(),
   // Idempotency: if the same key is retried, the mini returns the SAME jobId (no new job).
   idempotencyKey: z.string().min(1),      // Vercel sets this = `${linearSessionId}:${kind}:${round}`
 }).superRefine((v, ctx) => {

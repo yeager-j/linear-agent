@@ -4,6 +4,7 @@ import { setRunnerDeps } from "./deps.ts";
 import { freshDb, testConfig } from "../test-helpers.ts";
 import { insertJob, getJob } from "../db.ts";
 import { nullLinearClient } from "../linear.ts";
+import { setJobToken, deleteJobToken } from "../job-tokens.ts";
 import type { SDKLikeMessage } from "../activity-bridge.ts";
 import type { QueryFn, QueryParams } from "../sdk.ts";
 import type { Database } from "bun:sqlite";
@@ -154,5 +155,48 @@ describe("runPlan", () => {
     });
     const res = await runPlan({ job: getJob(sdb, "j4")!, signal: ac.signal });
     expect(res.status).toBe("aborted");
+  });
+
+  test("passes the per-job token to makeLinear", async () => {
+    const sdb = singletonDb();
+    insertJob(sdb, {
+      job_id: "j5",
+      linear_session_id: "s5",
+      issue_identifier: "ENG-5",
+      kind: "plan",
+      idempotency_key: "s5:plan:0",
+      prompt_context: "x",
+      status: "running",
+    });
+    setJobToken("j5", "per-job-tok");
+    let seenToken: string | undefined;
+    restore = setRunnerDeps({
+      makeLinear: (token) => {
+        seenToken = token;
+        return nullLinearClient();
+      },
+      prepareWorkspace: fakeWorkspace as never,
+      query: fakeQuery([{ type: "result", subtype: "success", session_id: "cs", result: "Plan" }]),
+    });
+    await runPlan({ job: getJob(sdb, "j5")!, signal: new AbortController().signal });
+    expect(seenToken).toBe("per-job-tok");
+    deleteJobToken("j5");
+  });
+
+  test("no per-job token and no env fallback => failed missing-linear-token", async () => {
+    testConfig({ linearAccessToken: undefined, defaultRepoUrl: "git@github.com:o/r.git", dbPath: ":memory:" });
+    const sdb = singletonDb();
+    insertJob(sdb, {
+      job_id: "j6",
+      linear_session_id: "s6",
+      issue_identifier: "ENG-6",
+      kind: "plan",
+      idempotency_key: "s6:plan:0",
+      prompt_context: "x",
+      status: "running",
+    });
+    const res = await runPlan({ job: getJob(sdb, "j6")!, signal: new AbortController().signal });
+    expect(res.status).toBe("failed");
+    expect(res.reason).toBe("missing-linear-token");
   });
 });

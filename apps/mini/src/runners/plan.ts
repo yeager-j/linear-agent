@@ -15,6 +15,7 @@ import { config } from "../config.ts";
 import { db, latestClaudeSessionId } from "../db.ts";
 import { bridgeStream } from "../activity-bridge.ts";
 import { runnerDeps } from "./deps.ts";
+import { getJobToken } from "../job-tokens.ts";
 import { makeCanUseTool } from "./question-handler.ts";
 import { log } from "../log.ts";
 
@@ -46,8 +47,17 @@ export async function runPlan(ctx: RunnerContext): Promise<RunnerResult> {
   const { job, signal } = ctx;
   const deps = runnerDeps();
   const d = db();
-  const linear = deps.makeLinear();
   const cfg = config();
+
+  // Per-job Linear token (Vercel mints it fresh per job). Once the static env fallback is removed at
+  // cutover, a real job without one can't stream to Linear — fail loud so the misconfig surfaces as
+  // a Linear error (via the callback) instead of a silent activity-less "success".
+  const linearToken = getJobToken(job.job_id) ?? cfg.linearAccessToken;
+  if (!linearToken && !cfg.linearDryRun) {
+    log.error("missing-linear-token: no per-job token and no env fallback; failing job", { jobId: job.job_id });
+    return { status: "failed", reason: "missing-linear-token" };
+  }
+  const linear = deps.makeLinear(linearToken);
 
   const repoUrl = cfg.defaultRepoUrl;
   if (!repoUrl) {

@@ -19,6 +19,7 @@ import { config } from "../config.ts";
 import { db, latestClaudeSessionId } from "../db.ts";
 import { bridgeStream } from "../activity-bridge.ts";
 import { runnerDeps } from "./deps.ts";
+import { getJobToken } from "../job-tokens.ts";
 import { makeCanUseTool } from "./question-handler.ts";
 import { parseOwnerRepo, pushAndOpenPr } from "../github/pr.ts";
 import { log } from "../log.ts";
@@ -53,7 +54,15 @@ export async function runExecute(ctx: RunnerContext): Promise<RunnerResult> {
   const deps = runnerDeps();
   const d = db();
   const cfg = config();
-  const linear = deps.makeLinear();
+
+  // Per-job Linear token (see runPlan). Fail loud when absent on a real run rather than execute
+  // silently with no activity stream.
+  const linearToken = getJobToken(job.job_id) ?? cfg.linearAccessToken;
+  if (!linearToken && !cfg.linearDryRun) {
+    log.error("missing-linear-token: no per-job token and no env fallback; failing job", { jobId: job.job_id });
+    return { status: "failed", reason: "missing-linear-token" };
+  }
+  const linear = deps.makeLinear(linearToken);
 
   const repoUrl = cfg.defaultRepoUrl;
   if (!repoUrl) return { status: "failed", reason: "no repo configured (DEFAULT_REPO_URL unset)" };
